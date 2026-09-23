@@ -58,13 +58,17 @@ def adjust_actions_with_forecast(
     Downshift if rain is enough; upshift if hot+windy stress.
     """
     def down(a):
-        if a == ACTION_NOW: return ACTION_SOON
-        if a == ACTION_SOON: return ACTION_WAIT
+        if a == ACTION_NOW:
+            return ACTION_SOON
+        if a == ACTION_SOON:
+            return ACTION_WAIT
         return ACTION_WAIT
 
     def up(a):
-        if a == ACTION_WAIT: return ACTION_SOON
-        if a == ACTION_SOON: return ACTION_NOW
+        if a == ACTION_WAIT:
+            return ACTION_SOON
+        if a == ACTION_SOON:
+            return ACTION_NOW
         return ACTION_NOW
 
     out = actions[:]

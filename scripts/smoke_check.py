@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.features import build_temporal_features
-from core.io import normalize_weekly_df
+from core.features import build_temporal_features  # noqa: E402 - needs ROOT on sys.path
+from core.io import normalize_weekly_df  # noqa: E402
 
 MODEL_PATH = ROOT / "models" / "need_rf_pipeline.joblib"
 META_PATH = ROOT / "models" / "need_rf_metadata.json"

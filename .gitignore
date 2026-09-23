@@ -1,0 +1,33 @@
+# --- Operational data. Never commit: this is the Association's operating record. ---
+# weekly/live exports, cell coordinates
+data/
+# field boundary shapefile
+boundary/
+# trained model, metadata, training snapshots
+models/
+*.csv
+*.parquet
+*.joblib
+*.pkl
+*.xlsx
+*.xls
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.gpkg
+
+# --- Secrets ---
+.env
+# any other *.env variant. env.example is NOT matched.
+*.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/

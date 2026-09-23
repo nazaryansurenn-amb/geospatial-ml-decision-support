@@ -17,10 +17,6 @@ if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
   if not defined PYTHON_EXE set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 )
 
-if not defined PYTHON_EXE if exist "%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" (
-  set "PYTHON_EXE=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-)
-
 if not defined PYTHON_EXE (
   for /f "delims=" %%P in ('where py 2^>nul') do (
     if not defined PYTHON_EXE (
@@ -43,14 +39,8 @@ if not defined PYTHON_EXE (
   exit /b 1
 )
 
-if not exist "%PROJECT_SITE_PACKAGES%" (
-  echo Project site-packages not found at %PROJECT_SITE_PACKAGES%
-  echo Recreate the environment or install dependencies first.
-  pause
-  exit /b 1
-)
-
-set "PYTHONPATH=%PROJECT_SITE_PACKAGES%;%PYTHONPATH%"
+rem A project .venv is optional: without one, packages from "pip install -r requirements.txt" are used.
+if exist "%PROJECT_SITE_PACKAGES%" set "PYTHONPATH=%PROJECT_SITE_PACKAGES%;%PYTHONPATH%"
 set "STREAMLIT_BROWSER_GATHER_USAGE_STATS=false"
 set "STREAMLIT_SERVER_HEADLESS=true"
 
