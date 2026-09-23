@@ -1,217 +1,165 @@
-# Irrigation Need Prediction — Water User Association Decision Support
+# Irrigation Need Prediction
 
-A Streamlit tool that predicts, week by week and cell by cell, where a Water User Association should
-irrigate next — and puts the answer on a map so a field crew knows where to go first.
+Streamlit decision-support tool for the Echmiadzin Water User Association (Armavir region, Armenia).
+Each week it classifies every 250 m grid cell of the service area as **WAIT**, **SOON** or **NOW**
+for irrigation, using Sentinel-2 indices and weather. The result is shown on a map.
 
-Built for the Echmiadzin Water User Association in Armenia's Armavir region, on five seasons of
-operational and satellite data.
+Code only. The Association's data, boundary and trained model are not included (see [Data](#data)).
 
----
+## Pipeline
 
-## The problem
+| Step | What it does | Code |
+|---|---|---|
+| Grid | 250 m square cells built in UTM zone 38N (`EPSG:32638`) around each centroid, then reprojected to WGS84 | `core/grid.py` |
+| Load | Reads weekly per-cell CSV exports, normalises column-name variants (`CellID`/`cell_id`, `weekStart`/`week_start`) and replaces `-9999` with NaN | `core/io.py` |
+| Crop type | Classifies each cell per season from its NDVI: `NON_AGRI`, `PERENNIAL` or `ANNUAL` | training script |
+| Features | 36 numeric features plus crop type | `core/features.py` |
+| Labels | Rule-based need score, mapped to three classes | training script |
+| Model | RandomForest classifier, WAIT / SOON / NOW | training script |
+| App | Scores the selected or latest week and draws the map | `app.py` |
 
-A Water User Association distributes irrigation water across thousands of hectares with a small field
-crew and no way to see the whole system at once. In practice, decisions about where to send water are
-made from experience, phone calls, and whichever complaint arrived most recently.
+### Input columns
 
-The question the crew needs answered is not *"what is the soil moisture index of this polygon"*. It is
-**"where do we go first this week?"** That is a prioritisation problem, not a measurement problem, and
-the distinction drove every design decision below.
-
----
-
-## How it works
-
-### 1. The grid
-
-The service area is divided into **250 m × 250 m cells**. Cell centroids arrive as lat/lon; the tool
-projects them to UTM (`EPSG:32638`, the Echmiadzin zone), builds a square polygon around each centre
-in metres, and projects back to WGS84 for mapping.
-
-Projecting before building the squares matters: constructing a "square" in degrees produces cells that
-are not square and whose area varies with latitude.
-
-*`core/grid.py`*
-
-### 2. Weekly observations
-
-Each cell gets a weekly record combining earth-observation indices and weather:
-
-| Signal | Meaning |
+| Column | Meaning |
 |---|---|
-| `NDVI_med` | vegetation vigour — is there a crop here at all |
-| `NDMI_med` | canopy/soil moisture |
-| `dNDMI` | week-on-week moisture change |
-| `dVV` | Sentinel-1 radar backscatter change — negative means drying |
-| `WetScore` | composite wetness indicator |
-| `Rain_mm_7d`, `Temp_C_7d`, `Wind_ms_7d` | trailing 7-day weather |
-| `valid_s2`, `veg_flag`, `irr_event` | cloud validity, vegetation presence, known irrigation event |
+| `cell_id`, `week_start`, `week_end`, `year` | Required keys (`year` is derived from `week_start` if missing) |
+| `NDVI_med` | Median NDVI in the cell for the week |
+| `NDMI_med`, `dNDMI` | Median NDMI and its week-on-week change |
+| `Rain_mm_7d`, `Temp_C_7d` | 7-day rainfall and temperature |
+| `valid_s2` | 1 if the Sentinel-2 observation is cloud-free |
+| `veg_flag` | 1 if vegetation is present |
 
-The loader tolerates the column-naming drift that real exports accumulate — `CellID` / `cell_id`,
-`weekStart` / `week_start` — because operational data is not tidy and a tool that breaks on a renamed
-column will not be used twice.
+### Crop type
 
-*`core/io.py`*
+A green week is a valid observation with NDVI > 0.30.
 
-### 3. Teacher labels
+| Class | Condition |
+|---|---|
+| `NON_AGRI` | ≤ 2 green weeks and NDVI 90th percentile ≤ 0.20 |
+| `PERENNIAL` | ≥ 10 green weeks and NDVI 25th percentile ≥ 0.25 |
+| `ANNUAL` | otherwise |
 
-There is no ground-truth register of "this cell needed water on this date". So the training signal is
-built from an explicit agronomic rule, and the rule is written down rather than buried:
+### Features
 
-A cell **needs irrigation** when the Sentinel-2 observation is valid, vegetation is present
-(`veg_flag` or `NDVI ≥ 0.30`), trailing rainfall is under **8 mm/7d**, `WetScore` is under **0.65**,
-`NDMI ≤ 0.25`, and radar shows drying (`dVV ≤ −0.02`). A recorded irrigation event forces the label
-to zero.
+- Rolling 2-, 3-, 4- and 6-week windows of NDMI, NDMI change, rainfall and temperature
+- Counts of dry, hot and drying weeks over recent windows and year to date
+- Year-to-date NDMI drop from its peak, and cumulative rainfall
+- The cell's median NDMI, NDVI, rainfall and temperature for the same calendar month in earlier
+  years, and the current value's difference from it. These are empty for the first season and
+  are filled by median imputation.
+- Month and day of year
 
-Missing radar does not block a label — the rule falls back to optical plus weather rather than
-discarding the cell. Every threshold is a named, tunable parameter.
+### Labels
 
-*`core/labels.py`*
+There is no field record of when a cell needed water, so the training target is computed by a rule.
+The need score is a weighted sum of three terms, each scaled to 0–1:
 
-### 4. Features
+| Term | Scaled between | Weight (annual) | Weight (perennial) |
+|---|---|---|---|
+| NDMI dryness | 0.18 → 0.06 (annual), 0.20 → 0.05 (perennial) | 0.45 | 0.55 |
+| NDMI decline rate (−dNDMI) | 0 → 0.04 per week | 0.35 | 0.30 |
+| 7-day temperature | 18 → 32 °C | 0.20 | 0.15 |
 
-On top of the raw weekly signals, the pipeline builds **within-season history per cell**: cumulative
-NDMI peak to date, drop from that peak, 2- and 3-week rolling means, and monthly baselines for NDMI,
-NDVI, rainfall and temperature.
+The score is set to 0 when 7-day rainfall exceeds 15 mm, when there is no vegetation, or when the
+cell is `NON_AGRI`. Classes: **NOW** ≥ 0.66, **SOON** ≥ 0.33, otherwise **WAIT**. `WetScore` and
+Sentinel-1 radar (`dVV`) are left out of both the target and the features.
 
-The reasoning is that absolute moisture is less informative than *moisture relative to where this
-particular cell was three weeks ago and where it usually is in this month*. A cell at NDMI 0.20 that
-has been falling for three weeks is a different case from one at 0.20 that has been flat all season.
+### Model
 
-*`core/features.py`*
+- scikit-learn `RandomForestClassifier`: 300 trees, `min_samples_leaf=2`,
+  `class_weight="balanced_subsample"`
+- Median imputation for numeric features, one-hot encoding for crop type
+- Trained on 2021–2025, on rows with `veg_flag = 1`
+- Stratified 80/20 random split (`random_state=42`)
+- In the app, each cell gets the predicted class and a priority score of 0.5·P(SOON) + P(NOW)
 
-### 5. Model
+## Application
 
-**XGBoost** when available (400 trees, depth 6, learning rate 0.05, subsample and column-sample 0.9,
-L2 = 1.0), falling back automatically to a **class-balanced RandomForest** (500 trees) when it is not.
-Trained on **2021–2025**: 1,435,014 cell-weeks loaded, 609,593 rows after filtering to the growing
-season and valid observations.
+- **Historical view:** pick a season and week from the weekly exports.
+- **Live view:** the latest file in `data/live_exports/`, with features computed against the
+  historical exports.
+- **Map:** Folium, on Esri satellite imagery, with the WUA boundary. Cells are coloured by class.
+  Cells without a valid observation are hidden unless "Show low-confidence cells" is on.
+- **Tabs:** overall, annual crops and perennial crops.
+- **Comparisons:** week-on-week changes, spatial clusters of urgent cells, and the same time of
+  year in previous seasons (±14 days).
+- **Optional analyst panel:** OpenAI-based briefing and per-cell explanations. Needs
+  `OPENAI_API_KEY`. The rest of the app works without it.
 
-The binary need-probability is converted to a three-class action by two thresholds carried with the
-model, `T_decision` and `T_now`:
+## Evaluation
 
-```
-p < T_decision   ->  WAIT
-T_decision..T_now ->  IRRIGATE_SOON
-p >= T_now       ->  IRRIGATE_NOW
-```
+Last training run: 1,435,014 cell-weeks loaded, 609,593 training rows after the `veg_flag = 1`
+filter. Held-out accuracy is about 0.99 per year, for example 0.9916 on 26,726 rows for 2021
+(WAIT 12,716 / SOON 10,701 / NOW 3,309).
 
-Model, feature list and both thresholds travel together as a single `ModelBundle`, so inference cannot
-silently drift from training.
+This number measures how well the model reproduces the labelling rule. It does not measure
+agronomic correctness:
 
-*`core/model.py`, `train_need_ml.py`*
+- The labels are computed from inputs the model also sees, so near-perfect agreement is expected.
+- The split is random by row, so neighbouring weeks of the same cell fall on both sides of it.
+  Holding out whole seasons or whole areas would be a stricter test.
+- No field record of irrigation outcomes exists to validate against.
 
-### 6. Forecast and live run
-
-The live path picks the newest `live_*.csv` export, joins it to the cell grid, and calls
-[Open-Meteo](https://open-meteo.com/) for a 7-day precipitation, temperature and wind outlook per
-location — so a cell that is dry today but has 20 mm of rain coming is not sent a crew.
-
-Output renders as a Folium map coloured by action.
-
-*`core/live.py`, `core/forecast.py`*
-
-### 7. Debt notification module
-
-A separate workflow that turns overdue water accounts into registered-letter exports for **Haypost**
-(Armenian Post), producing the recipient, community, debt amount and period, notice text and tracking
-fields in the format the postal service expects.
-
-Included because it is part of the same operational reality: a Water User Association that cannot
-collect cannot maintain the network it is being asked to optimise.
-
-*`water_debt_notification_platform/`*
-
----
-
-## About the accuracy figures
-
-Per-year test accuracy sits around **0.99** (2021: 0.9916 on 26,726 held-out rows, across WAIT 12,716
-/ SOON 10,701 / NOW 3,309).
-
-**That number should not be read as "99% correct about reality", and I would rather say so than let a
-reader assume it.** The labels are teacher labels generated by the rule in `core/labels.py` from the
-same signals the model sees. So the model is largely learning to reproduce a deterministic function,
-and high agreement is the expected result, not evidence of agronomic truth.
-
-What the metric *does* establish: the learned model reproduces the expert rule faithfully while
-generalising across cells, seasons and missing data — which is what allows the rule to be replaced by
-a probability, and the probability by a graded three-class priority instead of a hard yes/no.
-
-Validating against actual field outcomes would require an irrigation log the Association does not
-currently keep. That is the honest ceiling on this work, and closing it is a data-collection problem
-rather than a modelling one.
-
----
-
-## Layout
+## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `app.py` | Streamlit application — map, filters, analyst panel |
-| `core/io.py` | Loading and normalising weekly and live exports |
-| `core/grid.py` | 250 m grid construction and reprojection |
-| `core/labels.py` | Agronomic teacher-label rule |
-| `core/features.py` | Temporal and baseline feature engineering |
-| `core/model.py` | Model bundle, training, thresholds, evaluation |
-| `core/forecast.py` | Open-Meteo 7-day forecast client |
-| `core/live.py` | Latest-export selection and action assignment |
-| `train_need_ml.py` | Training entry point |
-| `train_need_ml_2024_2025_stress_only_fixed.py` | Retraining variant restricted to water-stress seasons |
-| `scripts/smoke_check.py` | Integrity check: model + data + one prediction pass |
-| `tests/` | Unit tests for features, IO and live handling |
-| `water_debt_notification_platform/` | Debt-notice workflow and Haypost export |
+| `app.py` | Streamlit application |
+| `train_need_ml_2024_2025_stress_only_fixed.py` | Trains the model the app uses (2021–2025) |
+| `train_need_ml.py` | Earlier single-season (2024) trainer. Writes to the same model path, so running it replaces the current model. |
+| `core/io.py`, `core/grid.py`, `core/features.py` | Loading, grid construction, features |
+| `core/model.py`, `core/labels.py`, `core/live.py`, `core/forecast.py` | Alternative pipeline, not used by the app or the current trainer (see [Status](#status)) |
+| `scripts/smoke_check.py` | Loads the model and scores 20 rows of the latest live export |
+| `tests/` | Unit tests for `core/io.py`, `core/features.py` and `core/live.py` |
+| `water_debt_notification_platform/` | Standalone module for debt notices (see [Status](#status)) |
 
-## Stack
+## Running
 
-Python 3.12 · Streamlit · pandas · NumPy · scikit-learn · XGBoost (optional) · GeoPandas · Shapely ·
-pyproj · Folium · joblib · pytest · OpenAI (optional, analyst panel only)
-
-## Running it
+Python 3.12.
 
 ```bash
 pip install -r requirements.txt
-
-run.bat                        # launcher auto-detects an interpreter and starts Streamlit
-python scripts/smoke_check.py  # integrity check
-pytest -q                      # unit tests
+python train_need_ml_2024_2025_stress_only_fixed.py   # writes models/
+streamlit run app.py                                  # or run.bat on Windows
+pytest -q
+python scripts/smoke_check.py
 ```
 
-Optional environment variables — see `env.example`:
+Expected data layout:
 
-- `OPENAI_API_KEY` — enables the analyst copilot panel. The tool is fully functional without it.
-- `OPENAI_COPILOT_MODEL` — overrides the default copilot model.
+```text
+data/
+  weekly_exports/*.csv                  # one or more files per season, year in the file name
+  live_exports/*.csv                    # latest week
+  Echmiadzin_Cell_Coordinates.csv       # cell_id, lat, lon
+boundary/Echmiadzin_wua_Boundary.shp    # optional
+models/                                 # written by the training script
+```
 
----
+Optional environment variables (see `env.example`): `OPENAI_API_KEY` and `OPENAI_COPILOT_MODEL`.
 
-## Data is deliberately not published
+## Data
 
-This repository is **code only**. The Association's weekly and live exports, the field boundary
-shapefile, the trained model artifacts and the training snapshot are all excluded — they are a real
-organisation's operating record, and publishing them is not mine to do. `.gitignore` enforces it.
+The weekly and live exports, cell coordinates, boundary shapefile and trained model belong to the
+Water User Association and are not published. `.gitignore` excludes `data/`, `boundary/`, `models/`
+and the file types stored there.
 
-To run against your own data you need weekly per-cell records with the columns listed in section 2 and
-a cell-centroid CSV of `cell_id, lat, lon`.
+## Status
 
-## Honest status
+- Prototype. Runs locally, with no deployment and no authentication.
+- Built and calibrated for one Water User Association. The crop-type and label thresholds are
+  specific to it, and use elsewhere is untested.
+- `app.py` holds the UI and most of the analysis logic in one file.
+- `core/model.py`, `core/labels.py`, `core/live.py` and `core/forecast.py` are an alternative
+  design that is not connected to anything:
+  - a binary XGBoost/RandomForest model with two probability thresholds
+  - a label rule that uses `WetScore` and radar `dVV`
+  - a 7-day Open-Meteo forecast adjustment
+- `water_debt_notification_platform/` is not connected to the app. It maps debtor spreadsheets to
+  a Haypost (Armenian Post) registered-letter export and simulates dispatch. The live Haypost API
+  call is not implemented.
 
-- **Advanced prototype, unit tested.** Not a deployed product.
-- Local Streamlit app: no server deployment, no authentication, no multi-tenancy.
-- Trained and validated on a **single** Water User Association. Transfer to others is untested, and
-  the thresholds in `core/labels.py` are calibrated to this service area.
-- Accuracy is measured against teacher labels, not field outcomes — see above.
-- `app.py` is a monolith and should be decomposed; `core/` is where the reusable logic already lives.
-- The training/inference feature contract is carried by `ModelBundle` but not otherwise enforced.
+## Stack
 
-## Why it is built this way
-
-The interesting part of this project is not the gradient-boosted tree. Anyone can fit one.
-
-The judgement is in what the model is asked to predict and how the answer is presented. A probability
-surface is useless to a field crew; three actions on a map are not. The features are built from what a
-Water User Association actually records week to week, not from what would be ideal to have. Missing
-radar degrades the decision instead of dropping the cell. And the output is scoped to a decision
-somebody will make on Monday morning.
-
-That framing came from nine years working inside Armenia's irrigation system before writing any of
-this code.
+Python 3.12 · Streamlit · pandas · NumPy · scikit-learn · GeoPandas · Shapely · pyproj · Folium ·
+joblib · pytest · OpenAI (optional)
