@@ -1,8 +1,21 @@
-# Irrigation Need Prediction
+# Geospatial ML Decision Support
 
-Streamlit decision-support tool for the Echmiadzin Water User Association (Armavir region, Armenia).
-Each week it classifies every 250 m grid cell of the service area as **WAIT**, **SOON** or **NOW**
-for irrigation, using Sentinel-2 indices and weather. The result is shown on a map.
+[![CI](https://github.com/nazaryansurenn-amb/geospatial-ml-decision-support/actions/workflows/ci.yml/badge.svg)](https://github.com/nazaryansurenn-amb/geospatial-ml-decision-support/actions/workflows/ci.yml)
+
+A spatiotemporal classification pipeline with a map-based decision tool:
+
+- Sentinel-2 satellite indices and weather are aggregated per 250 m grid cell and per week.
+- Rolling-window and seasonal-baseline features are built from them.
+- A RandomForest assigns each cell one of three priority classes.
+
+There is no ground truth, so the model trains on labels produced by a documented rule (weak
+supervision). The evaluation section states what that does and does not show.
+
+Case study: weekly irrigation priorities (**WAIT** / **SOON** / **NOW**) for the Echmiadzin Water
+User Association, Armavir region, Armenia.
+
+Methods: geospatial grid construction and reprojection · time-series feature engineering · weak
+supervision · class-balanced RandomForest · per-year held-out evaluation · Streamlit and Folium.
 
 Code only. The Association's data, boundary and trained model are not included (see [Data](#data)).
 
