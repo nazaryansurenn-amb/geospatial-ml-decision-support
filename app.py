@@ -791,7 +791,7 @@ def filter_display_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[_valid_display_mask(df)].copy()
 
 
-def add_legend(m, palette_mode: str):
+def add_legend(m):
     html = f"""
     <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999; background: rgba(255,255,255,0.92); padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; box-shadow: 0 2px 10px rgba(0,0,0,0.2); width: 240px;">
       <div style="font-weight:700;margin-bottom:8px;font-size:14px;">ML Need Class</div>
@@ -804,7 +804,7 @@ def add_legend(m, palette_mode: str):
     m.get_root().html.add_child(Element(html))
 
 
-def render_map(grid, boundary, week_df, show_boundary_labels: bool, zero_to_gray_eps: float, palette_mode: str, show_gray_cells: bool, map_key: str = "irrigation_map"):
+def render_map(grid, boundary, week_df, show_boundary_labels: bool, show_gray_cells: bool, map_key: str = "irrigation_map"):
     if week_df is None or week_df.empty:
         st.warning("No rows to render.")
         return
@@ -838,7 +838,7 @@ def render_map(grid, boundary, week_df, show_boundary_labels: bool, zero_to_gray
     m = folium.Map(location=center, zoom_start=12, control_scale=True, tiles=None)
     folium.TileLayer(tiles=ESRI_TILES, attr=ESRI_ATTR, name="ESRI Satellite").add_to(m)
     add_boundary(m, boundary, label_col="name", show_labels=show_boundary_labels)
-    add_legend(m, palette_mode)
+    add_legend(m)
 
     def style_fn(feat):
         props = feat.get("properties", {})
@@ -1438,10 +1438,8 @@ def main_with_valid_display():
         perennial_green_weeks = st.slider("Perennial green weeks", 6, 20, 10, 1)
         perennial_p25 = st.number_input("Perennial NDVI p25 threshold", value=0.25, step=0.01, format="%.2f")
         st.divider()
-        palette_mode = st.radio("Map palette", options=["unified", "split"], index=0, format_func=lambda x: "Unified priority scale" if x == "unified" else "Crop-specific colors")
         show_gray_cells = st.checkbox("Show low-confidence cells", value=False)
         show_boundary_labels = st.checkbox("Show area labels", value=True)
-        zero_to_gray_eps = st.slider("Low-priority cutoff", 0.0, 0.30, 0.02, 0.01)
 
     live_label = None
     reference_exports = pd.DataFrame()
@@ -1531,10 +1529,8 @@ def main_with_valid_display():
             "ndvi_green_threshold": float(ndvi_green_thr),
             "perennial_green_weeks_threshold": int(perennial_green_weeks),
             "perennial_ndvi_p25_threshold": float(perennial_p25),
-            "palette_mode": palette_mode,
             "show_gray_cells": bool(show_gray_cells),
             "show_boundary_labels": bool(show_boundary_labels),
-            "zero_to_gray_need_threshold": float(zero_to_gray_eps),
             "section_key": section_key,
         }
         model_context = build_model_context(ml_meta, yearly_eval, top_features)
@@ -1544,7 +1540,6 @@ def main_with_valid_display():
             grid=grid,
             week_df=display_week_df,
             boundary=boundary,
-            urgent_probability_threshold=max(0.5, float(zero_to_gray_eps)),
         )
         copilot_context = build_copilot_context(
             df_week=display_week_df,
@@ -1695,8 +1690,6 @@ def main_with_valid_display():
             boundary=boundary,
             week_df=section_df,
             show_boundary_labels=show_boundary_labels,
-            zero_to_gray_eps=float(zero_to_gray_eps),
-            palette_mode=palette_mode,
             show_gray_cells=show_gray_cells,
             map_key=f"irrigation_map_{section_key}",
         )
