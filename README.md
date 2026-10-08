@@ -368,7 +368,6 @@ weather, the next-week forecast) and curated FAO / Earth-observation notes from
 | `core/baselines.py` | No-change and trend-rule baselines |
 | `core/features.py`, `core/crop.py`, `core/io.py`, `core/grid.py`, `core/runtime_artifacts.py` | Features, crop type, loading, grid, compact runtime files |
 | `core/ai.py`, `core/knowledge.py`, `core/i18n.py`, `core/forecast.py` | AI briefings, knowledge retrieval, translations, 7-day weather outlook |
-| `core/live.py` | Earlier forecast-adjustment helper, not used by the app |
 | `scripts/build_runtime_artifacts.py` | Weekly CSV exports → `data/runtime/` |
 | `scripts/train_next_week.py` | Trains the shipped model; scores 2024, 2025 and the live season against both baselines |
 | `scripts/evaluate_strict.py` | Strict out-of-time evaluation; the source of [Detailed results](#detailed-results) |
