@@ -2,32 +2,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import json
-import warnings
 import html
-from datetime import datetime
+import sys
 
-import joblib
-import numpy as np
-import pandas as pd
-import streamlit as st
-import folium
-from folium import Element
-from streamlit_folium import st_folium
-from sklearn import __version__ as sklearn_version
-from shapely.geometry import Point
-
-from core.features import build_temporal_features
-from core.io import load_exports
-from core.grid import load_coords, build_grid, load_boundary
-
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-APP_TITLE = "Irrigation Intelligence Dashboard"
-APP_SUBTITLE = "Satellite-informed water demand monitoring and field priorities"
-st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 ROOT = Path(__file__).parent
 
@@ -51,74 +28,90 @@ def load_local_env(env_path: Path):
 
 load_local_env(ROOT / ".env")
 
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import streamlit as st
+import folium
+from folium import Element
+from streamlit_folium import st_folium
+from shapely.geometry import Point
+
+from core.ai import (
+    COPILOT_GUIDANCE as AI_COPILOT_GUIDANCE,
+    DEFAULT_COPILOT_MODEL as AI_COPILOT_MODEL,
+    generate_copilot_response as ai_generate_copilot_response,
+    generate_copilot_summary as ai_generate_copilot_summary,
+    generate_next_week_outlook as ai_generate_next_week_outlook,
+)
+from core.crop import build_stable_crop_map, classify_crop_year
+from core.features import build_reference_monthly_baselines, build_temporal_features
+from core.forecast import build_sampling_grid, fetch_area_forecast
+from core.i18n import language_options, translate
+from core.knowledge import knowledge_sources as ai_knowledge_sources
+from core.io import (
+    assemble_live_season,
+    load_exports,
+    select_latest_week,
+    select_previous_week,
+)
+from core.grid import load_coords, build_grid, load_boundary
+from core.next_week import build_forecast_features, load_forecast_bundle, predict_next_week
+from core.rules import CLASS_ORDER, DEFAULT_RULE_PARAMS, RULE_VERSION, assign_rule_classes, rule_priority_score
+from core.runtime_artifacts import (
+    DEFAULT_CROP_THRESHOLDS,
+    REFERENCE_COLUMNS,
+    artifact_paths,
+    historical_crop_map_path,
+    historical_features_path,
+    load_runtime_manifest,
+)
+
+APP_TITLE = "Echmiadzin Irrigation Monitor"
+APP_SUBTITLE = "Weekly satellite monitoring of vegetation condition and irrigation priorities"
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# Standalone demo modules import `app` for the production data pipeline. When
+# Streamlit executes this file as its entry point, expose the running module
+# under that stable name so embedded pages reuse it instead of executing twice.
+sys.modules.setdefault("app", sys.modules[__name__])
+
+PRODUCT_VIEWS = (
+    "pressure_map",
+    "next_week_forecast",
+    "operations_ai",
+    "season_timelapse",
+    "weekly_change",
+)
+PRODUCT_VIEW_LABEL_KEYS = {
+    "pressure_map": "tool_pressure_map",
+    "next_week_forecast": "tool_next_week_forecast",
+    "operations_ai": "tool_operations_ai",
+    "season_timelapse": "tool_season_timelapse",
+    "weekly_change": "tool_weekly_change",
+}
+
 DATA_DIR = ROOT / "data"
 EXPORTS_DIR = DATA_DIR / "weekly_exports"
 LIVE_EXPORTS_DIR = DATA_DIR / "live_exports"
+RUNTIME_DIR = DATA_DIR / "runtime"
 COORDS_CSV = DATA_DIR / "Echmiadzin_Cell_Coordinates.csv"
 BOUNDARY_SHP = ROOT / "boundary" / "Echmiadzin_wua_Boundary.shp"
 
-MODEL_PATH = ROOT / "models" / "need_rf_pipeline.joblib"
-META_PATH = ROOT / "models" / "need_rf_metadata.json"
-YEARLY_EVAL_PATH = ROOT / "models" / "need_rf_yearly_evaluation.json"
-FEATURE_IMPORTANCE_PATH = ROOT / "models" / "need_rf_feature_importance_stress_only.csv"
+MODELS_DIR = ROOT / "models"
 
 ESRI_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 ESRI_ATTR = "Esri"
-DEFAULT_COPILOT_MODEL = os.getenv("OPENAI_COPILOT_MODEL", "gpt-5.4-mini")
-COPILOT_SYSTEM_PROMPT = """
-You are an irrigation analysis copilot for Echmiadzin.
-Use only the structured data provided to you.
-Write concise, evidence-based operational analysis for an irrigation analyst.
-Focus on current irrigation need, notable patterns, historical context, model context, spatial cluster context, and uncertainty.
-Do not invent facts, locations, or causes that are not present in the input.
-If the signals are mixed or limited, say so plainly.
-Use previous-years context and live-vs-previous-live context when they are provided.
-Prefer short markdown headings and compact bullets.
-When asked for a weekly summary, structure it as:
-## Current Situation
-## History And Change
-## Priority Cells
-## Uncertainty
-When asked about a selected cell, explain the predicted class, strongest evidence, historical context, and caution.
-When asked a user question, answer only from the supplied context and say clearly if the context is insufficient.
-When spatial clusters are provided, discuss urgent zones before isolated cells.
-Always follow the project guidance context if it is provided.
-""".strip()
-
-COPILOT_GUIDANCE = {
-    "invalid_data_rules": [
-        "-9999 means invalid or missing earth observation data.",
-        "Cells with invalid core inputs must not be treated as trustworthy irrigation evidence.",
-        "Hidden or invalid cells must not be described as urgent targets.",
-    ],
-    "crop_type_rules": [
-        "In live mode, perennial classification comes from historical years rather than only the current live file.",
-        "Crop type is a stability layer; irrigation need is still decided from live model features.",
-        "Annual and perennial sections should be interpreted separately when possible.",
-    ],
-    "need_interpretation_rules": [
-        "WAIT, SOON, and NOW come from the trained ML model.",
-        "Live irrigation need should be interpreted from current NDMI, dNDMI, rain, temperature, and other model features.",
-        "Prioritize spatial clusters over isolated cells when giving operational recommendations.",
-    ],
-    "earth_observation_notes": [
-        "NDMI and NDVI are observational indicators, not direct proof of irrigation events.",
-        "Recent rain and temperature should be interpreted together with vegetation and moisture signals.",
-        "Historical comparison is useful for judging whether the current week is abnormal for the same seasonal period.",
-    ],
-}
-
+CARTO_LIGHT_TILES = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+CARTO_ATTR = "OpenStreetMap contributors, CARTO"
+SHOW_INTERNAL_DIAGNOSTICS = os.getenv("SHOW_INTERNAL_DIAGNOSTICS", "0") == "1"
+PUBLIC_APP_MODE = os.getenv("PUBLIC_APP_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+PUBLIC_LANGUAGE_CODES = tuple(
+    code.strip().lower()
+    for code in os.getenv("PUBLIC_LANGUAGES", "en,ru").split(",")
+    if code.strip()
+)
 GRAY = "#BDBDBD"
-Y_LIGHT = (255, 249, 196)
-Y_DARK = (249, 168, 37)
-R_LIGHT = (255, 205, 210)
-R_DARK = (183, 28, 28)
-
-UNIFIED_STOPS = [
-    (0.00, (255, 249, 196)),
-    (0.50, (255, 167, 38)),
-    (1.00, (183, 28, 28)),
-]
 
 
 def apply_dashboard_theme():
@@ -139,6 +132,12 @@ def apply_dashboard_theme():
         section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
         section[data-testid="stSidebar"] label {
             color: #d7e4f2;
+        }
+        section[data-testid="stSidebar"] div[data-baseweb="select"] > div {
+            background: #f8fbfe;
+        }
+        section[data-testid="stSidebar"] div[data-baseweb="select"] * {
+            color: #20323e !important;
         }
         .main .block-container {
             padding-top: 1.25rem;
@@ -218,9 +217,7 @@ def apply_dashboard_theme():
         .ai-studio {
             position: relative;
             overflow: hidden;
-            background:
-                radial-gradient(circle at 88% 10%, rgba(246, 178, 70, 0.28), transparent 30%),
-                linear-gradient(135deg, #0f1f33 0%, #153f50 52%, #1d6c65 100%);
+            background: linear-gradient(135deg, #0f1f33 0%, #153f50 52%, #1d6c65 100%);
             border: 1px solid rgba(255,255,255,0.16);
             border-radius: 8px;
             padding: 1.25rem;
@@ -252,6 +249,7 @@ def apply_dashboard_theme():
             font-size: 1.55rem;
             line-height: 1.2;
             letter-spacing: 0;
+            color: #ffffff !important;
         }
         .ai-studio p {
             margin: 0.45rem 0 0;
@@ -283,9 +281,10 @@ def apply_dashboard_theme():
             margin-top: 0.2rem;
             color: #ffffff;
             font-size: 1.05rem;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            line-height: 1.2;
+            min-height: 2.4em;
+            white-space: normal;
+            overflow-wrap: anywhere;
         }
         .ai-result-title {
             margin-top: 0.9rem;
@@ -308,37 +307,44 @@ def apply_dashboard_theme():
     )
 
 
-def render_dashboard_header():
+def render_dashboard_header(language: str = "en"):
     st.markdown(
         f"""
         <div class="app-hero">
-            <h1>{APP_TITLE}</h1>
-            <p>{APP_SUBTITLE}</p>
+            <h1>{html.escape(translate("app_title", language))}</h1>
+            <p>{html.escape(translate("app_subtitle", language))}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_ai_studio_header(section_title, selected_cell_id, display_week_df, spatial_cluster_summary):
-    zones = len(spatial_cluster_summary.get("clusters", [])) if spatial_cluster_summary else 0
+def render_ai_studio_header(section_title, selected_cell_id, display_week_df, spatial_cluster_summary, language: str = "en"):
+    high_priority_cells = 0
+    if not display_week_df.empty and "need_class_ml" in display_week_df.columns:
+        high_priority_cells = int(display_week_df["need_class_ml"].astype(str).str.upper().eq("NOW").sum())
     if not display_week_df.empty and "need_prob_ml" in display_week_df.columns:
         top_priority = _safe_num(display_week_df["need_prob_ml"]).max()
         top_priority_text = f"{top_priority:.2f}" if pd.notna(top_priority) else "n/a"
     else:
         top_priority_text = "n/a"
-    focus_text = selected_cell_id if selected_cell_id is not None else "Not selected"
+    if PUBLIC_APP_MODE:
+        focus_label = translate("valid_vegetation", language)
+        focus_text = f"{int((_safe_num(display_week_df.get('veg_flag')).fillna(0) == 1).sum()):,}" if "veg_flag" in display_week_df.columns else "0"
+    else:
+        focus_label = translate("focus_cell", language)
+        focus_text = selected_cell_id if selected_cell_id is not None else translate("not_selected", language)
     st.markdown(
         f"""
         <div class="ai-studio">
-            <div class="ai-kicker">AI Insight Studio</div>
-            <h2>Executive field briefing</h2>
+            <div class="ai-kicker">{html.escape(translate("ai_studio", language))}</div>
+            <h2>{html.escape(translate("executive_field_briefing", language))}</h2>
             <p>{html.escape(str(section_title))}</p>
             <div class="ai-grid">
-                <div class="ai-stat"><span>View</span><strong>{html.escape(str(section_title))}</strong></div>
-                <div class="ai-stat"><span>Focus cell</span><strong>{html.escape(str(focus_text))}</strong></div>
-                <div class="ai-stat"><span>Priority zones</span><strong>{zones:,}</strong></div>
-                <div class="ai-stat"><span>Top score</span><strong>{html.escape(top_priority_text)}</strong></div>
+                <div class="ai-stat"><span>{html.escape(translate("view", language))}</span><strong>{html.escape(str(section_title))}</strong></div>
+                <div class="ai-stat"><span>{html.escape(focus_label)}</span><strong>{html.escape(str(focus_text))}</strong></div>
+                <div class="ai-stat"><span>{html.escape(translate("high_cells", language))}</span><strong>{high_priority_cells:,}</strong></div>
+                <div class="ai-stat"><span>{html.escape(translate("top_score", language))}</span><strong>{html.escape(top_priority_text)}</strong></div>
             </div>
         </div>
         """,
@@ -348,6 +354,36 @@ def render_ai_studio_header(section_title, selected_cell_id, display_week_df, sp
 
 def _safe_num(x):
     return pd.to_numeric(x, errors="coerce")
+
+
+def render_approved_pressure_surface(week_df: pd.DataFrame, boundary, language: str, map_key: str) -> None:
+    import pressure_surface_demo as surface_demo
+    from pressure_surface_vegetation_demo import build_vegetation_surface
+
+    if week_df is None or week_df.empty:
+        st.info(translate("map_no_rows", language))
+        return
+    try:
+        surface = build_vegetation_surface(week_df, boundary)
+    except Exception:
+        st.info(translate("map_no_matches", language))
+        return
+
+    show_grid = False
+    if not PUBLIC_APP_MODE:
+        show_grid = st.toggle(
+            surface_demo.t(language, "show_grid"),
+            value=False,
+            key=f"approved_grid_{map_key}",
+        )
+    irrigation_map = surface_demo.build_map(surface, boundary, language, show_grid)
+    st_folium(
+        irrigation_map,
+        width=None,
+        height=760,
+        key=f"approved_pressure_{map_key}_{language}_{show_grid}",
+        returned_objects=[],
+    )
 
 
 def _geometry_center_point(geometries):
@@ -400,100 +436,10 @@ def _normalize_cell_id_series(series: pd.Series) -> pd.Series:
     return series.apply(_normalize_cell_id_value)
 
 
-def _rgb_to_hex(rgb):
-    r, g, b = rgb
-    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
-
-
-def _lerp(a, b, t: float):
-    return a + (b - a) * t
-
-
-def _ramp(light_rgb, dark_rgb, t: float):
-    t = float(np.clip(t, 0.0, 1.0))
-    return (
-        _lerp(light_rgb[0], dark_rgb[0], t),
-        _lerp(light_rgb[1], dark_rgb[1], t),
-        _lerp(light_rgb[2], dark_rgb[2], t),
-    )
-
-
-def _multi_ramp(stops, t: float):
-    t = float(np.clip(t, 0.0, 1.0))
-    for i in range(len(stops) - 1):
-        p0, c0 = stops[i]
-        p1, c1 = stops[i + 1]
-        if p0 <= t <= p1:
-            local = 0.0 if p1 == p0 else (t - p0) / (p1 - p0)
-            return (
-                _lerp(c0[0], c1[0], local),
-                _lerp(c0[1], c1[1], local),
-                _lerp(c0[2], c1[2], local),
-            )
-    return stops[-1][1]
-
-
 @st.cache_resource
-def load_ml_artifacts():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
-    model = None
-    sklearn_warning = None
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        model = joblib.load(MODEL_PATH)
-    for w in caught:
-        if "InconsistentVersionWarning" in getattr(w.category, "__name__", ""):
-            sklearn_warning = str(w.message)
-            break
-
-    meta = {}
-    if META_PATH.exists():
-        try:
-            meta = json.loads(META_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
-    # Avoid carrying machine-specific absolute paths from training metadata.
-    for key in ("model_path", "feature_importance_path", "training_snapshot_path", "yearly_evaluation_path"):
-        val = meta.get(key)
-        if isinstance(val, str) and (":\\" in val or val.startswith("/")):
-            meta[key] = Path(val).name
-    if sklearn_warning:
-        meta["model_runtime_warning"] = (
-            f"Model/runtime sklearn mismatch detected. Runtime sklearn={sklearn_version}. "
-            f"Details: {sklearn_warning}"
-        )
-    return model, meta
-
-
-@st.cache_data(show_spinner=False)
-def load_yearly_evaluation():
-    if not YEARLY_EVAL_PATH.exists():
-        return {}
-    try:
-        return json.loads(YEARLY_EVAL_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-@st.cache_data(show_spinner=False)
-def load_top_feature_importance(top_n: int = 10):
-    if not FEATURE_IMPORTANCE_PATH.exists():
-        return []
-    try:
-        fi = pd.read_csv(FEATURE_IMPORTANCE_PATH)
-    except Exception:
-        return []
-    if fi.empty or "feature" not in fi.columns or "importance" not in fi.columns:
-        return []
-    fi = fi.sort_values("importance", ascending=False).head(int(top_n)).copy()
-    return [
-        {
-            "feature": str(row["feature"]),
-            "importance": round(float(row["importance"]), 6),
-        }
-        for _, row in fi.iterrows()
-    ]
+def load_forecast_artifacts():
+    """Next-week forecast model and its training metadata, or None when not trained yet."""
+    return load_forecast_bundle(MODELS_DIR)
 
 
 @st.cache_data(show_spinner=False)
@@ -525,12 +471,11 @@ def live_exports_signature():
     return tuple(signature)
 
 
-def format_live_signature_item(signature_item):
-    if not signature_item:
-        return None
-    name, mtime_ns, size = signature_item
-    updated = datetime.fromtimestamp(int(mtime_ns) / 1_000_000_000).strftime("%Y-%m-%d %H:%M:%S")
-    return f"{name} | updated {updated} | {int(size):,} bytes"
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_area_forecast_cached():
+    coordinates = load_coords(COORDS_CSV)
+    points = build_sampling_grid(coordinates, rows=3, columns=3)
+    return fetch_area_forecast(points)
 
 
 @st.cache_data(show_spinner="Loading historical exports...")
@@ -552,120 +497,122 @@ def load_all_exports_cached():
     return exports
 
 
-@st.cache_data(show_spinner="Loading latest live export...")
-def load_live_latest_cached(live_signature=None):
-    files = _live_export_files()
-    if not files:
-        return pd.DataFrame()
-
-    df = pd.read_csv(files[0]).copy()
-    df["source_file"] = files[0].name
-    if "week_start" in df.columns:
-        df["week_start"] = pd.to_datetime(df["week_start"], errors="coerce")
-    if "week_end" in df.columns:
-        df["week_end"] = pd.to_datetime(df["week_end"], errors="coerce")
-    df = df.dropna(subset=["cell_id"])
-    df["cell_id"] = _normalize_cell_id_series(df["cell_id"])
-    df = df.dropna(subset=["cell_id"])
-
-    if "year" not in df.columns:
-        if "week_start" in df.columns and df["week_start"].notna().any():
-            df["year"] = df["week_start"].dt.year
-        else:
-            df["year"] = 2026
-    if "doy" not in df.columns and "week_start" in df.columns:
-        df["doy"] = df["week_start"].dt.dayofyear
-    if "month" not in df.columns and "week_start" in df.columns:
-        df["month"] = df["week_start"].dt.month
-    return df
+def _prepare_runtime_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    for column in ("week_start", "week_end"):
+        if column in out.columns:
+            out[column] = pd.to_datetime(out[column], errors="coerce")
+    if "cell_id" in out.columns:
+        out["cell_id"] = _normalize_cell_id_series(out["cell_id"])
+    return out
 
 
-@st.cache_data(show_spinner="Loading previous live export...")
-def load_live_previous_cached(live_signature=None):
-    files = _live_export_files()
-    if len(files) < 2:
-        return pd.DataFrame()
-
-    df = pd.read_csv(files[1]).copy()
-    df["source_file"] = files[1].name
-    if "week_start" in df.columns:
-        df["week_start"] = pd.to_datetime(df["week_start"], errors="coerce")
-    if "week_end" in df.columns:
-        df["week_end"] = pd.to_datetime(df["week_end"], errors="coerce")
-    df = df.dropna(subset=["cell_id"])
-    df["cell_id"] = _normalize_cell_id_series(df["cell_id"])
-    df = df.dropna(subset=["cell_id"])
-    if "year" not in df.columns:
-        if "week_start" in df.columns and df["week_start"].notna().any():
-            df["year"] = df["week_start"].dt.year
-        else:
-            df["year"] = 2026
-    if "doy" not in df.columns and "week_start" in df.columns:
-        df["doy"] = df["week_start"].dt.dayofyear
-    if "month" not in df.columns and "week_start" in df.columns:
-        df["month"] = df["week_start"].dt.month
-    return df
+@st.cache_data(show_spinner=False)
+def load_runtime_manifest_cached():
+    return load_runtime_manifest(RUNTIME_DIR)
 
 
-def compute_crop_type_apr_sep(
-    df_year: pd.DataFrame,
-    ndvi_green_thr: float = 0.30,
-    perennial_green_weeks: int = 10,
-    perennial_p25: float = 0.25,
-    nonagri_p90_max: float = 0.20,
-    nonagri_green_weeks_max: int = 2,
-) -> pd.DataFrame:
-    df = df_year.copy()
-    df["cell_id"] = df["cell_id"].astype(str)
+@st.cache_data(show_spinner=False)
+def load_historical_years_cached() -> tuple[int, ...]:
+    manifest = load_runtime_manifest_cached()
+    years = tuple(int(year) for year in manifest.get("years", []))
+    if years:
+        return years
+    exports = load_all_exports_cached()
+    return tuple(sorted(exports["year"].dropna().astype(int).unique().tolist()))
 
-    ndvi = _safe_num(df.get("NDVI_med"))
-    valid = _safe_num(df.get("valid_s2")).fillna(0).astype(int) if "valid_s2" in df.columns else pd.Series(1, index=df.index, dtype=int)
-    ok = (valid == 1) & ndvi.notna() & (ndvi != -9999)
-    df = df.loc[ok, ["cell_id", "NDVI_med"]].copy()
 
-    if df.empty:
-        out = df_year[["cell_id"]].drop_duplicates().copy()
-        out["crop_type"] = "ANNUAL"
-        return out
+@st.cache_data(show_spinner="Loading compact historical context...")
+def load_historical_reference_cached(history_years: tuple[int, ...] = ()) -> pd.DataFrame:
+    reference_path = artifact_paths(RUNTIME_DIR)["historical_reference"]
+    if reference_path.exists():
+        reference = _prepare_runtime_frame(pd.read_parquet(reference_path))
+    else:
+        exports = load_all_exports_cached()
+        reference = exports[[column for column in REFERENCE_COLUMNS if column in exports.columns]].copy()
+    if history_years and "year" in reference.columns:
+        allowed_years = {int(year) for year in history_years}
+        reference = reference[pd.to_numeric(reference["year"], errors="coerce").isin(allowed_years)].copy()
+    return reference
 
-    def p25(x): return float(np.nanpercentile(x, 25)) if len(x) else np.nan
-    def p90(x): return float(np.nanpercentile(x, 90)) if len(x) else np.nan
 
-    g = df.groupby("cell_id")["NDVI_med"]
-    stats = pd.DataFrame({
-        "cell_id": g.size().index.astype(str),
-        "NDVI_p25": g.apply(p25).values,
-        "NDVI_p90": g.apply(p90).values,
-        "GREEN_WEEKS": g.apply(lambda s: int((pd.to_numeric(s, errors="coerce") > ndvi_green_thr).sum())).values,
-    })
-    is_nonagri = (stats["GREEN_WEEKS"] <= nonagri_green_weeks_max) & (stats["NDVI_p90"] <= nonagri_p90_max)
-    is_perennial = (stats["GREEN_WEEKS"] >= perennial_green_weeks) & (stats["NDVI_p25"] >= perennial_p25)
-    stats["crop_type"] = np.where(is_nonagri, "NON_AGRI", np.where(is_perennial, "PERENNIAL", "ANNUAL"))
-    return stats[["cell_id", "crop_type"]].copy()
+@st.cache_data(show_spinner=False)
+def load_monthly_baselines_cached(history_years: tuple[int, ...]) -> pd.DataFrame:
+    manifest = load_runtime_manifest_cached()
+    manifest_years = tuple(int(year) for year in manifest.get("years", []))
+    baseline_path = artifact_paths(RUNTIME_DIR)["monthly_baselines"]
+    if baseline_path.exists() and tuple(sorted(history_years)) == tuple(sorted(manifest_years)):
+        return _prepare_runtime_frame(pd.read_parquet(baseline_path))
+    reference = load_historical_reference_cached(history_years)
+    return build_reference_monthly_baselines(reference)
+
+
+@st.cache_data(show_spinner="Loading live season...")
+def load_live_season_cached(live_signature=None):
+    season, report = assemble_live_season(LIVE_EXPORTS_DIR)
+    if report.errors:
+        raise ValueError("; ".join(report.messages("error")))
+    return season, report
 
 
 @st.cache_data(show_spinner="Preparing selected historical year...")
 def prepare_year_data_cached(year: int):
+    # Rules run on the whole period: NOW needs the cell's previous week.
+    runtime_path = historical_features_path(RUNTIME_DIR, year)
+    if runtime_path.exists():
+        return assign_rule_classes(_prepare_runtime_frame(pd.read_parquet(runtime_path)))
     exports = load_all_exports_cached()
     featured = build_temporal_features(exports)
-    return featured[featured["year"].astype(int) == int(year)].copy()
+    return assign_rule_classes(featured[featured["year"].astype(int) == int(year)].copy())
 
 
 @st.cache_data(show_spinner="Preparing live features and history context...")
 def prepare_live_data_cached(history_years: tuple[int, ...], live_signature=None):
-    exports = load_all_exports_cached()
-    if history_years:
-        exports = exports[exports["year"].astype(int).isin([int(year) for year in history_years])].copy()
-    df_live = load_live_latest_cached(live_signature)
-    if df_live is None or df_live.empty:
+    live_season, _ = load_live_season_cached(live_signature)
+    if live_season is None or live_season.empty:
         return pd.DataFrame()
-    return build_temporal_features(df_live, history_reference=exports)
+    baselines = load_monthly_baselines_cached(history_years)
+    return assign_rule_classes(build_temporal_features(live_season, history_monthly_baselines=baselines))
+
+
+@st.cache_data(show_spinner="Preparing the next-week forecast...")
+def load_next_week_forecast_cached(
+    history_years: tuple[int, ...],
+    live_signature=None,
+    ndvi_green_thr: float = 0.30,
+    perennial_green_weeks: int = 10,
+    perennial_p25: float = 0.25,
+) -> pd.DataFrame:
+    """Forecast for the week after the latest live report, one row per vegetated cell."""
+    bundle = load_forecast_artifacts()
+    if bundle is None:
+        return pd.DataFrame()
+    season = prepare_live_data_cached(history_years, live_signature)
+    if season.empty:
+        return pd.DataFrame()
+    crop_map = build_live_crop_map_cached(history_years, ndvi_green_thr, perennial_green_weeks, perennial_p25)
+    features = build_forecast_features(season, crop_map)
+    latest = features[features["week_start"] == features["week_start"].max()]
+    return predict_next_week(latest, bundle)
+
+
+def _uses_default_crop_thresholds(ndvi_green_thr: float, perennial_green_weeks: int, perennial_p25: float) -> bool:
+    return (
+        np.isclose(float(ndvi_green_thr), DEFAULT_CROP_THRESHOLDS["ndvi_green_thr"])
+        and int(perennial_green_weeks) == DEFAULT_CROP_THRESHOLDS["perennial_green_weeks"]
+        and np.isclose(float(perennial_p25), DEFAULT_CROP_THRESHOLDS["perennial_p25"])
+    )
 
 
 @st.cache_data(show_spinner="Building crop map...")
 def build_crop_map_cached(df_year: pd.DataFrame, ndvi_green_thr: float, perennial_green_weeks: int, perennial_p25: float):
-    return compute_crop_type_apr_sep(
-        df_year=df_year,
+    years = pd.to_numeric(df_year.get("year"), errors="coerce").dropna().astype(int).unique().tolist()
+    if len(years) == 1 and _uses_default_crop_thresholds(ndvi_green_thr, perennial_green_weeks, perennial_p25):
+        runtime_path = historical_crop_map_path(RUNTIME_DIR, years[0])
+        if runtime_path.exists():
+            return _prepare_runtime_frame(pd.read_parquet(runtime_path))
+    return classify_crop_year(
+        df_year,
         ndvi_green_thr=float(ndvi_green_thr),
         perennial_green_weeks=int(perennial_green_weeks),
         perennial_p25=float(perennial_p25),
@@ -674,22 +621,27 @@ def build_crop_map_cached(df_year: pd.DataFrame, ndvi_green_thr: float, perennia
 
 @st.cache_data(show_spinner="Building historical perennial map for live mode...")
 def build_live_crop_map_cached(history_years: tuple[int, ...], ndvi_green_thr: float, perennial_green_weeks: int, perennial_p25: float):
-    exports = load_all_exports_cached()
-    if exports is None or exports.empty:
+    manifest = load_runtime_manifest_cached()
+    manifest_years = tuple(int(year) for year in manifest.get("years", []))
+    stable_path = artifact_paths(RUNTIME_DIR)["stable_crop_map"]
+    if (
+        stable_path.exists()
+        and tuple(sorted(history_years)) == tuple(sorted(manifest_years))
+        and _uses_default_crop_thresholds(ndvi_green_thr, perennial_green_weeks, perennial_p25)
+    ):
+        return _prepare_runtime_frame(pd.read_parquet(stable_path))
+    reference = load_historical_reference_cached(history_years)
+    if reference is None or reference.empty:
         return pd.DataFrame(columns=["cell_id", "crop_type"])
-    if history_years:
-        exports = exports[exports["year"].astype(int).isin([int(year) for year in history_years])].copy()
-    if exports.empty:
-        return pd.DataFrame(columns=["cell_id", "crop_type"])
-    return compute_crop_type_apr_sep(
-        df_year=exports,
+    return build_stable_crop_map(
+        history=reference,
         ndvi_green_thr=float(ndvi_green_thr),
         perennial_green_weeks=int(perennial_green_weeks),
         perennial_p25=float(perennial_p25),
     )
 
 
-def add_ml_predictions(df_week: pd.DataFrame, crop_map: pd.DataFrame, model, meta: dict):
+def add_priority_predictions(df_week: pd.DataFrame, crop_map: pd.DataFrame):
     out = df_week.copy()
     out["cell_id"] = out["cell_id"].astype(str)
 
@@ -700,68 +652,47 @@ def add_ml_predictions(df_week: pd.DataFrame, crop_map: pd.DataFrame, model, met
     out = out.merge(cm, on="cell_id", how="left")
     out["crop_type"] = out["crop_type"].fillna("ANNUAL")
 
-    feature_cols_num = meta.get("feature_cols_num", [
-        "NDVI_med", "NDMI_med", "dNDMI", "ndmi_drop_ytd", "ndmi_mean_2w", "ndmi_mean_3w",
-        "ndmi_mean_4w", "dndmi_mean_2w", "dndmi_mean_4w", "Rain_mm_7d", "Rain2w", "Rain3w",
-        "Rain4w", "Rain6w", "dry_weeks_3w", "dry_weeks_6w", "rain_cum_ytd", "Temp_C_7d",
-        "temp_mean_2w", "temp_mean_4w", "hot2w", "hot4w", "hot_weeks_ytd", "drying3w",
-        "drying6w", "drying_weeks_ytd", "ndmi_cell_month_hist_med", "ndmi_vs_cell_month_hist_med",
-        "ndvi_cell_month_hist_med", "ndvi_vs_cell_month_hist_med", "rain_cell_month_hist_med",
-        "rain_vs_cell_month_hist_med", "temp_cell_month_hist_med", "temp_vs_cell_month_hist_med",
-        "month", "doy"
-    ])
-    feature_cols_cat = meta.get("feature_cols_cat", ["crop_type"])
+    # Frames from prepare_*_data_cached already carry rule classes for the whole period.
+    # Classifying a single week here cannot see the previous week, so NOW falls back to SOON.
+    if "rule_class" not in out.columns:
+        out = assign_rule_classes(out)
 
-    for col in feature_cols_num:
-        if col not in out.columns:
-            out[col] = np.nan
-        out[col] = _safe_num(out[col])
-    for col in feature_cols_cat:
-        if col not in out.columns:
-            out[col] = "ANNUAL"
-        out[col] = out[col].astype(str)
-
-    features = out[feature_cols_num + feature_cols_cat].copy()
-    pred = model.predict(features)
-    out["need_class_ml"] = pd.Series(pred, index=out.index).astype(str)
-
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(features)
-        classes = [str(c) for c in model.classes_]
-        proba_df = pd.DataFrame(proba, columns=[f"p_{c}" for c in classes], index=out.index)
-        out = pd.concat([out, proba_df], axis=1)
-        out["need_prob_ml"] = 0.0
-        if "p_SOON" in out.columns:
-            out["need_prob_ml"] += 0.5 * out["p_SOON"].fillna(0)
-        if "p_NOW" in out.columns:
-            out["need_prob_ml"] += 1.0 * out["p_NOW"].fillna(0)
-        out["need_prob_ml"] = out["need_prob_ml"].clip(0, 1)
-    else:
-        out["need_prob_ml"] = np.where(out["need_class_ml"].eq("NOW"), 1.0, np.where(out["need_class_ml"].eq("SOON"), 0.5, 0.0))
+    # need_class_ml / need_prob_ml / p_* keep their historical names for the map, zone and
+    # AI code; they now carry the rule classes (core/rules.py) instead of a model output.
+    out["need_class_ml"] = out["rule_class"].astype(object)
+    for class_name in CLASS_ORDER:
+        out[f"p_{class_name}"] = out["rule_class"].eq(class_name).astype(float)
+    out["need_prob_ml"] = rule_priority_score(out)
     return out
 
 
-def add_boundary(m, boundary_gdf, label_col="name", show_labels=True):
+def add_boundary(m, boundary_gdf, label_col="name", show_labels=True, layer_name="WUA Boundary", show_layer=True):
     if boundary_gdf is None or boundary_gdf.empty:
         return
     def style_fn(_):
-        return {"color": "#00acc1", "weight": 2, "fillOpacity": 0}
+        return {"color": "#247a83", "weight": 1.0, "opacity": 0.62, "fillOpacity": 0}
 
     tooltip = folium.GeoJsonTooltip(fields=[label_col]) if label_col in boundary_gdf.columns else None
-    folium.GeoJson(boundary_gdf, name="WUA Boundary", style_function=style_fn, tooltip=tooltip).add_to(m)
+    folium.GeoJson(
+        boundary_gdf,
+        name=layer_name,
+        style_function=style_fn,
+        tooltip=tooltip,
+        show=show_layer,
+    ).add_to(m)
 
     if show_labels and label_col in boundary_gdf.columns:
         for _, r in boundary_gdf.iterrows():
             c = r.geometry.centroid
             folium.Marker(
                 location=(c.y, c.x),
-                icon=folium.DivIcon(html=f"<div style='font-size:13px; font-weight:700; color:#00796b;'>{r[label_col]}</div>"),
+                icon=folium.DivIcon(html=f"<div style='font-size:11px; font-weight:650; color:#16616d; white-space:nowrap; text-shadow:0 1px 2px #fff;'>{html.escape(str(r[label_col]))}</div>"),
             ).add_to(m)
 
 
-WAIT_COLOR = "#43a047"
-SOON_COLOR = "#fdd835"
-NOW_COLOR = "#e53935"
+WAIT_COLOR = "#3c9874"
+SOON_COLOR = "#f2a93b"
+NOW_COLOR = "#cf3f36"
 
 
 def _valid_display_mask(df: pd.DataFrame) -> pd.Series:
@@ -791,22 +722,73 @@ def filter_display_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[_valid_display_mask(df)].copy()
 
 
-def add_legend(m):
-    html = f"""
-    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999; background: rgba(255,255,255,0.92); padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; box-shadow: 0 2px 10px rgba(0,0,0,0.2); width: 240px;">
-      <div style="font-weight:700;margin-bottom:8px;font-size:14px;">ML Need Class</div>
-      <div style="display:flex;align-items:center;font-size:12px;margin-bottom:6px;"><div style="width:14px;height:14px;background:{WAIT_COLOR};margin-right:8px;border:1px solid #444;"></div><div>WAIT</div></div>
-      <div style="display:flex;align-items:center;font-size:12px;margin-bottom:6px;"><div style="width:14px;height:14px;background:{SOON_COLOR};margin-right:8px;border:1px solid #444;"></div><div>SOON</div></div>
-      <div style="display:flex;align-items:center;font-size:12px;margin-bottom:8px;"><div style="width:14px;height:14px;background:{NOW_COLOR};margin-right:8px;border:1px solid #444;"></div><div>NOW</div></div>
-      <div style="display:flex;align-items:center;font-size:12px;"><div style="width:14px;height:14px;background:{GRAY};margin-right:8px;border:1px solid #444;"></div><div>Invalid or hidden cells</div></div>
+def add_legend(m, palette_mode: str, language: str = "en"):
+    legend_html = f"""
+    <div style="position:fixed;bottom:24px;left:20px;z-index:9999;background:rgba(255,255,255,0.96);padding:10px 12px;border-radius:6px;border:1px solid #d7dee5;box-shadow:0 3px 12px rgba(20,40,60,0.14);min-width:176px;">
+      <div style="font-weight:700;margin-bottom:7px;font-size:12px;color:#243746;">{html.escape(translate("legend_title", language))}</div>
+      <div style="display:flex;align-items:center;font-size:11px;margin-bottom:5px;color:#34495e;"><div style="width:12px;height:12px;background:{NOW_COLOR};margin-right:7px;border-radius:2px;"></div><div>{html.escape(translate("class_now", language))}</div></div>
+      <div style="display:flex;align-items:center;font-size:11px;margin-bottom:5px;color:#34495e;"><div style="width:12px;height:12px;background:{SOON_COLOR};margin-right:7px;border-radius:2px;"></div><div>{html.escape(translate("class_soon", language))}</div></div>
+      <div style="display:flex;align-items:center;font-size:11px;color:#34495e;"><div style="width:12px;height:12px;background:{WAIT_COLOR};margin-right:7px;border-radius:2px;"></div><div>{html.escape(translate("class_wait", language))}</div></div>
     </div>
     """
-    m.get_root().html.add_child(Element(html))
+    m.get_root().html.add_child(Element(legend_html))
 
 
-def render_map(grid, boundary, week_df, show_boundary_labels: bool, show_gray_cells: bool, map_key: str = "irrigation_map"):
+def build_area_priority_overview(merged, boundary, language: str = "en"):
+    if boundary is None or boundary.empty or "name" not in boundary.columns or merged.empty:
+        return gpd.GeoDataFrame()
+
+    valid_cells = merged.loc[merged["_display_valid"]].copy()
+    if valid_cells.empty:
+        return gpd.GeoDataFrame()
+
+    points = valid_cells[["cell_id", "need_class_ml", "need_prob_ml", "geometry"]].copy()
+    points["geometry"] = points.geometry.map(lambda geometry: geometry.centroid if geometry is not None else None)
+    areas = boundary[["name", "geometry"]].copy()
+    joined = gpd.sjoin(points, areas, how="inner", predicate="within")
+    if joined.empty:
+        return gpd.GeoDataFrame()
+    joined = joined.sort_values(["cell_id", "name"]).drop_duplicates("cell_id", keep="first")
+    joined["need_class_ml"] = joined["need_class_ml"].astype(str).str.upper()
+    joined["need_prob_ml"] = _safe_num(joined["need_prob_ml"])
+    joined["_high"] = joined["need_class_ml"].eq("NOW").astype(int)
+    joined["_soon"] = joined["need_class_ml"].eq("SOON").astype(int)
+    joined["_routine"] = joined["need_class_ml"].eq("WAIT").astype(int)
+
+    summary = joined.groupby("name", as_index=False).agg(
+        _cell_count=("cell_id", "nunique"),
+        _high_cells=("_high", "sum"),
+        _soon_cells=("_soon", "sum"),
+        _routine_cells=("_routine", "sum"),
+        _mean_priority=("need_prob_ml", "mean"),
+    )
+    count_columns = ["_high_cells", "_soon_cells", "_routine_cells"]
+    dominant_indices = summary[count_columns].to_numpy().argmax(axis=1)
+    summary["_area_class"] = np.array(["NOW", "SOON", "WAIT"])[dominant_indices]
+    summary["_area_name"] = summary["name"].astype(str)
+    summary["_area_priority"] = summary["_area_class"].map({
+        "NOW": translate("class_now", language),
+        "SOON": translate("class_soon", language),
+        "WAIT": translate("class_wait", language),
+    })
+    summary["_mean_priority"] = summary["_mean_priority"].round(2)
+    return areas.merge(summary, on="name", how="left")
+
+
+def render_map(
+    grid,
+    boundary,
+    week_df,
+    show_boundary_labels: bool,
+    zero_to_gray_eps: float,
+    palette_mode: str,
+    show_gray_cells: bool,
+    spatial_cluster_summary: dict | None = None,
+    map_key: str = "irrigation_map",
+    language: str = "en",
+):
     if week_df is None or week_df.empty:
-        st.warning("No rows to render.")
+        st.warning(translate("map_no_rows", language))
         return
 
     merged = grid.copy()
@@ -825,46 +807,196 @@ def render_map(grid, boundary, week_df, show_boundary_labels: bool, show_gray_ce
     if not show_gray_cells:
         merged = merged.loc[merged["_display_valid"]].copy()
     if merged.empty:
-        st.warning("No cells match the current map filters.")
+        st.warning(translate("map_no_matches", language))
         return
+
+    class_labels = {
+        "WAIT": translate("class_wait", language),
+        "SOON": translate("class_soon", language),
+        "NOW": translate("class_now", language),
+    }
+    crop_labels = {
+        "ANNUAL": translate("annual", language),
+        "PERENNIAL": translate("perennial", language),
+        "NON_AGRI": translate("non_agri", language),
+    }
+    if "need_class_ml" in merged.columns:
+        merged["_priority_label"] = merged["need_class_ml"].astype(str).str.upper().map(class_labels)
+    if "crop_type" in merged.columns:
+        merged["_crop_label"] = merged["crop_type"].astype(str).str.upper().map(crop_labels)
 
     center_geometries = boundary.geometry if boundary is not None and not boundary.empty else merged.geometry
     cen = _geometry_center_point(center_geometries)
     if cen is None:
-        st.warning("Map center could not be calculated from the available geometries.")
+        st.warning(translate("map_no_center", language))
         return
     center = (float(cen.y), float(cen.x))
 
-    m = folium.Map(location=center, zoom_start=12, control_scale=True, tiles=None)
-    folium.TileLayer(tiles=ESRI_TILES, attr=ESRI_ATTR, name="ESRI Satellite").add_to(m)
-    add_boundary(m, boundary, label_col="name", show_labels=show_boundary_labels)
-    add_legend(m)
+    m = folium.Map(location=center, zoom_start=11, control_scale=True, tiles=None, prefer_canvas=True)
+    folium.TileLayer(
+        tiles=CARTO_LIGHT_TILES,
+        attr=CARTO_ATTR,
+        name=translate("map_clean", language),
+        overlay=False,
+        control=True,
+        show=True,
+    ).add_to(m)
+    folium.TileLayer(
+        tiles=ESRI_TILES,
+        attr=ESRI_ATTR,
+        name=translate("map_satellite", language),
+        overlay=False,
+        control=True,
+        show=False,
+    ).add_to(m)
+    add_legend(m, palette_mode, language)
 
-    def style_fn(feat):
+    def detailed_style_fn(feat):
         props = feat.get("properties", {})
         if not bool(props.get("_display_valid", False)):
-            return {"fillColor": GRAY, "color": GRAY, "weight": 0.15, "fillOpacity": 0.18}
+            return {"fillColor": GRAY, "color": "#ffffff", "weight": 0.2, "fillOpacity": 0.12}
         need_class = str(props.get("need_class_ml", "")).upper()
         color = {"WAIT": WAIT_COLOR, "SOON": SOON_COLOR, "NOW": NOW_COLOR}.get(need_class, GRAY)
-        return {"fillColor": color, "color": color, "weight": 0.15, "fillOpacity": 0.60}
+        opacity = {"WAIT": 0.28, "SOON": 0.46, "NOW": 0.62}.get(need_class, 0.12)
+        return {"fillColor": color, "color": "#ffffff", "weight": 0.25, "opacity": 0.45, "fillOpacity": opacity}
+
+    def priority_style_fn(feat):
+        need_class = str(feat.get("properties", {}).get("need_class_ml", "")).upper()
+        color = NOW_COLOR if need_class == "NOW" else SOON_COLOR
+        return {
+            "fillColor": color,
+            "color": color,
+            "weight": 0,
+            "fillOpacity": 0.72 if need_class == "NOW" else 0.48,
+        }
+
+    def highlight_fn(_):
+        return {"color": "#ffffff", "weight": 1.8, "opacity": 1, "fillOpacity": 0.78}
+
+    area_overview = build_area_priority_overview(merged, boundary, language)
+    if not area_overview.empty:
+        def area_style_fn(feat):
+            area_class = str(feat.get("properties", {}).get("_area_class", "")).upper()
+            color = {"WAIT": WAIT_COLOR, "SOON": SOON_COLOR, "NOW": NOW_COLOR}.get(area_class, GRAY)
+            has_result = area_class in {"WAIT", "SOON", "NOW"}
+            return {
+                "fillColor": color,
+                "color": "#ffffff",
+                "weight": 1.2,
+                "opacity": 0.95,
+                "fillOpacity": 0.62 if has_result else 0.16,
+            }
+
+        folium.GeoJson(
+            area_overview,
+            name=translate("map_area_overview", language),
+            style_function=area_style_fn,
+            highlight_function=highlight_fn,
+            tooltip=folium.GeoJsonTooltip(
+                fields=["_area_name", "_area_priority", "_high_cells", "_soon_cells", "_routine_cells", "_mean_priority"],
+                aliases=[
+                    f"{translate('area', language)}:",
+                    f"{translate('priority_class', language)}:",
+                    f"{translate('high_cells', language)}:",
+                    f"{translate('soon_cells', language)}:",
+                    f"{translate('routine_cells', language)}:",
+                    f"{translate('mean_score', language)}:",
+                ],
+                sticky=True,
+            ),
+            show=True,
+        ).add_to(m)
 
     tooltip_fields = ["cell_id"]
-    tooltip_aliases = ["cell_id:"]
-    for c, a in [("crop_type", "crop_type:"), ("need_class_ml", "need_class_ml:"), ("need_prob_ml", "need_prob_ml:"), ("veg_flag", "veg_flag:"), ("NDVI_med", "NDVI:"), ("NDMI_med", "NDMI:"), ("dNDMI", "dNDMI:"), ("ndmi_drop_ytd", "ndmi_drop_ytd:"), ("Rain_mm_7d", "Rain7d:"), ("Rain2w", "Rain2w:"), ("Rain3w", "Rain3w:"), ("Temp_C_7d", "Temp7d:")]:
+    tooltip_aliases = [f"{translate('cell_id', language)}:"]
+    for c, a in [("_crop_label", f"{translate('crop_type', language)}:"), ("_priority_label", f"{translate('priority_class', language)}:"), ("need_prob_ml", f"{translate('priority_score', language)}:"), ("NDVI_med", "NDVI:"), ("NDMI_med", "NDMI:"), ("dNDMI", "dNDMI:"), ("Rain_mm_7d", "Rain 7d:"), ("Rain2w", "Rain 2w:"), ("Rain3w", "Rain 3w:"), ("Temp_C_7d", "Temp 7d:")]:
         if c in merged.columns:
             tooltip_fields.append(c)
             tooltip_aliases.append(a)
 
-    tooltip = None
-    if not merged.empty and tooltip_fields:
-        tooltip = folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, sticky=True)
+    def make_tooltip():
+        if merged.empty or not tooltip_fields:
+            return None
+        return folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, sticky=True)
 
-    folium.GeoJson(merged, name="250m Grid", style_function=style_fn, tooltip=tooltip).add_to(m)
-    folium.LayerControl(collapsed=False).add_to(m)
+    need_probability = _safe_num(merged.get("need_prob_ml", pd.Series(index=merged.index, dtype=float))).fillna(0)
+    priority_rows = merged[
+        merged["_display_valid"]
+        & merged.get("need_class_ml", pd.Series(index=merged.index, dtype=object)).astype(str).isin(["NOW", "SOON"])
+        & need_probability.gt(float(zero_to_gray_eps))
+    ].copy()
+    high_priority_rows = priority_rows[priority_rows["need_class_ml"].astype(str).eq("NOW")].copy()
+    attention_rows = priority_rows[priority_rows["need_class_ml"].astype(str).eq("SOON")].copy()
+    if not high_priority_rows.empty:
+        folium.GeoJson(
+            high_priority_rows,
+            name=translate("map_high_priority", language),
+            style_function=priority_style_fn,
+            highlight_function=highlight_fn,
+            tooltip=make_tooltip(),
+            show=False,
+        ).add_to(m)
+    if not attention_rows.empty:
+        folium.GeoJson(
+            attention_rows,
+            name=translate("map_attention_soon", language),
+            style_function=priority_style_fn,
+            highlight_function=highlight_fn,
+            tooltip=make_tooltip(),
+            show=False,
+        ).add_to(m)
+
+    folium.GeoJson(
+        merged,
+        name=translate("map_cell_detail", language),
+        style_function=detailed_style_fn,
+        highlight_function=highlight_fn,
+        tooltip=make_tooltip(),
+        show=False,
+    ).add_to(m)
+
+    if spatial_cluster_summary and spatial_cluster_summary.get("clusters"):
+        marker_layer = folium.FeatureGroup(name=translate("map_zone_markers", language), show=False)
+        for rank, cluster in enumerate(spatial_cluster_summary["clusters"], start=1):
+            lat = cluster.get("center_lat")
+            lon = cluster.get("center_lon")
+            if lat is None or lon is None:
+                continue
+            cluster_class = str(cluster.get("dominant_class", "SOON")).upper()
+            marker_color = NOW_COLOR if cluster_class == "NOW" else SOON_COLOR
+            area_name = cluster.get("boundary_name") or translate("not_selected", language)
+            marker_html = (
+                f"<div style='width:26px;height:26px;border-radius:50%;background:{marker_color};"
+                "border:2px solid #fff;box-shadow:0 2px 7px rgba(20,40,60,.35);"
+                "display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:750;'>"
+                f"{rank}</div>"
+            )
+            tooltip_html = (
+                f"<strong>{html.escape(str(area_name))}</strong><br>"
+                f"{html.escape(translate('cells', language))}: {int(cluster.get('cell_count') or 0)}<br>"
+                f"{html.escape(translate('priority_score', language))}: {float(cluster.get('max_need_probability') or 0):.2f}"
+            )
+            folium.Marker(
+                location=(float(lat), float(lon)),
+                icon=folium.DivIcon(html=marker_html, icon_size=(26, 26), icon_anchor=(13, 13)),
+                tooltip=folium.Tooltip(tooltip_html),
+            ).add_to(marker_layer)
+        marker_layer.add_to(m)
+
+    add_boundary(
+        m,
+        boundary,
+        label_col="name",
+        show_labels=show_boundary_labels,
+        layer_name=translate("map_boundary", language),
+        show_layer=False,
+    )
+
+    folium.LayerControl(collapsed=True, position="topright").add_to(m)
     st_folium(
         m,
         width=None,
-        height=720,
+        height=640,
         key=map_key,
         returned_objects=[],
     )
@@ -907,29 +1039,56 @@ def _sanitize_for_ai(value):
     return value
 
 
-def build_model_context(meta: dict, yearly_eval: dict, top_features: list[dict]) -> dict:
-    eval_summary = {}
-    for year, metrics in sorted(yearly_eval.items(), key=lambda kv: kv[0]):
-        if not isinstance(metrics, dict):
-            continue
-        eval_summary[str(year)] = {
-            "rows": int(metrics.get("rows", 0)),
-            "accuracy": _round_or_none(metrics.get("accuracy")),
-            "true_class_counts": metrics.get("true_class_counts", {}),
-            "pred_class_counts": metrics.get("pred_class_counts", {}),
+def build_method_context(forecast_metadata: dict | None) -> dict:
+    forecast = None
+    if forecast_metadata:
+        forecast = {
+            "target": forecast_metadata.get("target"),
+            "train_years": forecast_metadata.get("train_years", []),
+            "uses_weather_forecast": forecast_metadata.get("uses_weather_forecast"),
+            "baseline": forecast_metadata.get("baseline"),
+            "validation": forecast_metadata.get("validation", {}),
         }
-
     return {
-        "train_years": meta.get("train_years", []),
-        "effective_training_years": meta.get("effective_training_years", []),
-        "overall_accuracy": _round_or_none(meta.get("accuracy")),
-        "n_rows_total": int(meta.get("n_rows_total", 0)) if meta.get("n_rows_total") is not None else None,
-        "n_rows_train": int(meta.get("n_rows_train", 0)) if meta.get("n_rows_train") is not None else None,
-        "classes": meta.get("classes", []),
-        "rows_by_year_after_training_filters": meta.get("rows_by_year", {}).get("after_training_filters", {}),
-        "yearly_evaluation": eval_summary,
-        "top_feature_importance": top_features,
-        "note": meta.get("note"),
+        "priority_method": "explicit rules on vegetated cells (NDVI >= 0.30)",
+        "rule_version": RULE_VERSION,
+        "rule_parameters": DEFAULT_RULE_PARAMS,
+        "rule_summary": {
+            "NOW": "2-week NDMI very dry, drying or below the cell's normal for the month, no rain relief, and SOON/NOW in the previous week",
+            "SOON": "2-week NDMI dry without rain relief, very dry despite rain, or drying while below normal",
+            "WAIT": "all other vegetated cells",
+        },
+        "next_week_forecast_model": forecast,
+    }
+
+
+def build_next_week_forecast_summary(forecast: pd.DataFrame | None, current_display: pd.DataFrame | None) -> dict | None:
+    if forecast is None or forecast.empty:
+        return None
+    rows = forecast.copy()
+    if current_display is not None and not current_display.empty and "cell_id" in current_display.columns:
+        rows = rows[rows["cell_id"].astype(str).isin(set(current_display["cell_id"].astype(str)))]
+    if rows.empty:
+        return None
+
+    basis_start = pd.to_datetime(rows["week_start"], errors="coerce").max()
+    transitions = rows.groupby(["rule_class", "next_class"]).size()
+    escalating = (
+        rows[rows["rule_class"].ne("NOW")]
+        .sort_values("p_next_NOW", ascending=False)
+        .head(10)
+    )
+    return {
+        "basis_week_start": basis_start.date().isoformat() if pd.notna(basis_start) else None,
+        "forecast_week_start": (basis_start + pd.Timedelta(days=7)).date().isoformat() if pd.notna(basis_start) else None,
+        "current_class_counts": {name: int(rows["rule_class"].eq(name).sum()) for name in CLASS_ORDER},
+        "forecast_class_counts": {name: int(rows["next_class"].eq(name).sum()) for name in CLASS_ORDER},
+        "transitions": {f"{a}->{b}": int(n) for (a, b), n in transitions.items() if a != b},
+        "cells_most_likely_to_become_high_priority": [
+            {"cell_id": str(r.cell_id), "current_class": r.rule_class, "probability_now_next_week": round(float(r.p_next_NOW), 3)}
+            for r in escalating.itertuples(index=False)
+        ],
+        "note": "Model forecast of next week's rule class from this week's observations. It is not an observation.",
     }
 
 
@@ -1193,6 +1352,7 @@ def build_copilot_context(
     ui_context: dict | None = None,
     live_comparison_summary: dict | None = None,
     spatial_cluster_summary: dict | None = None,
+    next_week_forecast: dict | None = None,
 ) -> dict:
     if df_week is None or df_week.empty:
         return {
@@ -1263,7 +1423,7 @@ def build_copilot_context(
         "mode": mode,
         "title_suffix": title_suffix,
         "live_source_file": live_label,
-        "project_guidance": COPILOT_GUIDANCE,
+        "project_guidance": AI_COPILOT_GUIDANCE,
         "row_count": int(len(df)),
         "week_start": week_start,
         "week_end": week_end,
@@ -1279,10 +1439,12 @@ def build_copilot_context(
         "ui_context": ui_context,
         "live_comparison_summary": live_comparison_summary,
         "spatial_cluster_summary": spatial_cluster_summary,
+        "next_week_forecast": next_week_forecast,
         "context_availability": {
             "has_previous_years_summary": previous_years_summary is not None,
             "has_live_comparison_summary": live_comparison_summary is not None,
             "has_spatial_cluster_summary": bool(spatial_cluster_summary and spatial_cluster_summary.get("clusters")),
+            "has_next_week_forecast": next_week_forecast is not None,
         },
         "field_priority_brief": field_priority_brief,
     }
@@ -1367,95 +1529,114 @@ def build_selected_cell_context(
     })
 
 
-def generate_copilot_response(context: dict, task_prompt: str, max_output_tokens: int = 500) -> tuple[str | None, str | None]:
-    if OpenAI is None:
-        return None, "The `openai` Python package is not installed in this environment."
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None, "Set `OPENAI_API_KEY` to enable the AI copilot panel."
-
-    try:
-        clean_context = _sanitize_for_ai(context)
-        client = OpenAI(api_key=api_key)
-        response = client.responses.create(
-            model=DEFAULT_COPILOT_MODEL,
-            instructions=COPILOT_SYSTEM_PROMPT,
-            input=[
-                {"role": "user", "content": task_prompt},
-                {"role": "user", "content": json.dumps(clean_context, ensure_ascii=True, indent=2)},
-            ],
-            max_output_tokens=int(max_output_tokens),
-        )
-    except Exception as exc:
-        return None, f"Copilot request failed: {exc}"
-
-    summary = getattr(response, "output_text", None)
-    if isinstance(summary, str) and summary.strip():
-        return summary.strip(), None
-    return None, "The AI copilot returned an empty response."
-
-
-def generate_copilot_summary(context: dict) -> tuple[str | None, str | None]:
-    return generate_copilot_response(
-        context=context,
-        task_prompt=(
-            "Create a field-priority briefing for this irrigation view. "
-            "Use exactly these markdown sections: "
-            "## Inspect First, ## Why Now, ## What Changed, ## Uncertainty. "
-            "Start with the top 3 zones or cells to inspect first. "
-            "If previous_years_summary exists, use it explicitly. "
-            "If live_comparison_summary exists, quantify what changed from the previous live file. "
-            "Do not say those contexts are missing unless their values are null or empty in the supplied payload. "
-            "Keep the briefing practical and decisive."
-        ),
-        max_output_tokens=650,
+def main():
+    apply_dashboard_theme()
+    language_choices = language_options(PUBLIC_LANGUAGE_CODES if PUBLIC_APP_MODE else None)
+    if not language_choices:
+        language_choices = language_options(("en",))
+    language_name = st.sidebar.selectbox(
+        "Language / Язык" if PUBLIC_APP_MODE else "Language / Լեզու / Язык",
+        options=list(language_choices),
+        index=0,
+        key="interface_language",
+    )
+    language = language_choices[language_name]
+    product_view = st.sidebar.radio(
+        translate("tool_menu", language),
+        options=PRODUCT_VIEWS,
+        index=0,
+        format_func=lambda value: translate(PRODUCT_VIEW_LABEL_KEYS[value], language),
+        key="product_view",
     )
 
+    if product_view == "pressure_map":
+        from pressure_surface_vegetation_demo import render_page
 
-def main_with_valid_display():
-    apply_dashboard_theme()
-    render_dashboard_header()
+        render_page(language)
+        return
+    if product_view == "next_week_forecast":
+        from next_week_forecast_page import render_page
+
+        render_page(language)
+        return
+    if product_view == "season_timelapse":
+        from pressure_surface_timelapse_demo import render_page
+
+        render_page(language)
+        return
+    if product_view == "weekly_change":
+        from pressure_change_timelapse_demo import render_page
+
+        render_page(language)
+        return
+
+    render_dashboard_header(language)
 
     try:
         grid, boundary = load_spatial()
-        ml_model, ml_meta = load_ml_artifacts()
     except Exception as e:
         st.error(str(e))
         return
+    forecast_bundle = load_forecast_artifacts()
 
-    exports = load_all_exports_cached()
     live_signature = live_exports_signature()
-    live_df = load_live_latest_cached(live_signature)
-    live_prev_df = load_live_previous_cached(live_signature)
-    yearly_eval = load_yearly_evaluation()
-    top_features = load_top_feature_importance(10)
+    try:
+        live_season_raw, live_report = load_live_season_cached(live_signature)
+    except Exception:
+        live_season_raw, live_report = pd.DataFrame(), None
 
-    with st.sidebar:
-        st.header("Decision Controls")
-        mode = st.radio("Data view", options=["historical", "live"], index=0, format_func=lambda x: "Historical baseline" if x == "historical" else "Current monitoring")
-        ndvi_green_thr = st.number_input("Green cover threshold", value=0.30, step=0.01, format="%.2f")
-        perennial_green_weeks = st.slider("Perennial green weeks", 6, 20, 10, 1)
-        perennial_p25 = st.number_input("Perennial NDVI p25 threshold", value=0.25, step=0.01, format="%.2f")
-        st.divider()
-        show_gray_cells = st.checkbox("Show low-confidence cells", value=False)
-        show_boundary_labels = st.checkbox("Show area labels", value=True)
+    if PUBLIC_APP_MODE:
+        mode = "live" if not live_season_raw.empty else "historical"
+        ndvi_green_thr = 0.30
+        perennial_green_weeks = 10
+        perennial_p25 = 0.25
+        palette_mode = "unified"
+        show_gray_cells = False
+        show_boundary_labels = False
+        zero_to_gray_eps = 0.02
+    else:
+        with st.sidebar:
+            st.header(translate("decision_controls", language))
+            mode = st.radio(
+                translate("data_view", language),
+                options=["historical", "live"],
+                index=1 if not live_season_raw.empty else 0,
+                format_func=lambda value: translate("historical_baseline", language) if value == "historical" else translate("current_monitoring", language),
+            )
+            ndvi_green_thr = st.number_input(translate("green_cover_threshold", language), value=0.30, step=0.01, format="%.2f")
+            perennial_green_weeks = st.slider(translate("perennial_green_weeks", language), 6, 20, 10, 1)
+            perennial_p25 = st.number_input(translate("perennial_ndvi_threshold", language), value=0.25, step=0.01, format="%.2f")
+            st.divider()
+            palette_mode = st.radio(
+                translate("map_palette", language),
+                options=["unified", "split"],
+                index=0,
+                format_func=lambda value: translate("unified_priority_scale", language) if value == "unified" else translate("crop_specific_colors", language),
+            )
+            show_gray_cells = st.checkbox(translate("show_hidden_cells", language), value=False)
+            show_boundary_labels = st.checkbox(translate("area_labels", language), value=False)
+            zero_to_gray_eps = st.slider(translate("low_priority_cutoff", language), 0.0, 0.30, 0.02, 0.01)
+            if SHOW_INTERNAL_DIAGNOSTICS and live_report is not None:
+                for issue in live_report.warnings:
+                    st.warning(translate("data_warning", language, message=issue.message))
 
     live_label = None
     reference_exports = pd.DataFrame()
     df_prev_live_scored = pd.DataFrame()
+    weather_outlook = None
+    next_week_forecast_df = pd.DataFrame()
 
     if mode == "historical":
-        if exports is None or exports.empty:
-            st.error(f"No exports found in: {EXPORTS_DIR}")
+        years = list(load_historical_years_cached())
+        if not years:
+            st.error(translate("no_historical_exports", language))
             return
 
-        years = sorted(exports["year"].dropna().astype(int).unique().tolist())
-        sel_year = st.selectbox("Year", years, index=0 if 2024 not in years else years.index(2024))
+        sel_year = st.selectbox(translate("year", language), years, index=0 if 2024 not in years else years.index(2024))
         df_year = prepare_year_data_cached(int(sel_year))
         week_rows = df_year[["week_start", "week_end"]].dropna(subset=["week_start"]).drop_duplicates().sort_values("week_start")
         if week_rows.empty:
-            st.error("No weeks found for selected year.")
+            st.error(translate("no_weeks", language))
             return
 
         crop_map = build_crop_map_cached(df_year, float(ndvi_green_thr), int(perennial_green_weeks), float(perennial_p25))
@@ -1466,100 +1647,151 @@ def main_with_valid_display():
             options.append((r["week_start"], f"{ws} -> {we}"))
 
         sel_week_start = st.selectbox(
-            "Week (by start date)",
+            translate("week", language),
             options=[o[0] for o in options],
             format_func=lambda x: dict(options).get(x, str(x)),
             index=max(0, len(options) - 1),
         )
         df_week = df_year[df_year["week_start"] == sel_week_start].copy()
-        reference_exports = exports[exports["year"].astype(int) < int(sel_year)].copy()
-        title_suffix = f"Historical - {sel_year}"
+        prior_years = tuple(year for year in years if int(year) < int(sel_year))
+        reference_exports = load_historical_reference_cached(prior_years) if prior_years else pd.DataFrame()
+        title_suffix = f"{translate('historical_baseline', language)} - {sel_year}"
     else:
-        if live_df is None or live_df.empty:
-            st.error(f"No live CSV found in: {LIVE_EXPORTS_DIR}")
+        if live_season_raw is None or live_season_raw.empty:
+            st.error(translate("no_live_exports", language))
             return
-        history_years = tuple(int(year) for year in ml_meta.get("effective_training_years", []))
-        df_live = prepare_live_data_cached(history_years, live_signature)
+        history_years = tuple(int(year) for year in load_historical_years_cached())
+        df_live_season = prepare_live_data_cached(history_years, live_signature)
         crop_map = build_live_crop_map_cached(history_years, float(ndvi_green_thr), int(perennial_green_weeks), float(perennial_p25))
-        df_week = df_live.copy()
-        if exports is not None and not exports.empty and history_years:
-            reference_exports = exports[exports["year"].astype(int).isin(history_years)].copy()
-        if live_prev_df is not None and not live_prev_df.empty:
-            prev_live_temporal = build_temporal_features(live_prev_df.copy(), history_reference=exports)
-            prev_crop_map = crop_map
-            df_prev_live_scored = add_ml_predictions(prev_live_temporal.copy(), prev_crop_map, ml_model, ml_meta)
-        live_label = str(df_live["source_file"].iloc[0]) if "source_file" in df_live.columns else "Last_week.csv"
-        if "week_start" in df_live.columns and df_live["week_start"].notna().any():
-            ws = pd.Timestamp(df_live["week_start"].dropna().iloc[0]).date()
-            st.info(f"Current source: {live_label} - week starting {ws}")
-        else:
-            st.info(f"Current source: {live_label}")
-        live_file_status = format_live_signature_item(live_signature[0] if live_signature else None)
-        if live_file_status:
-            st.caption(f"Live file loaded: {live_file_status} | rows: {len(df_live):,}")
-        title_suffix = "Current monitoring"
+        df_week = select_latest_week(df_live_season)
+        if history_years:
+            reference_exports = load_historical_reference_cached(history_years)
+        prev_live_temporal = select_previous_week(df_live_season)
+        if not prev_live_temporal.empty:
+            df_prev_live_scored = add_priority_predictions(prev_live_temporal, crop_map)
+        source_names = sorted(df_week.get("source_file", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+        live_label = ", ".join(source_names) if source_names else "weekly export"
+        if PUBLIC_APP_MODE and "week_start" in df_week.columns and df_week["week_start"].notna().any():
+            ws = pd.Timestamp(df_week["week_start"].dropna().min()).date()
+            week_end = pd.to_datetime(df_week.get("week_end"), errors="coerce").dropna()
+            we = week_end.max().date() if not week_end.empty else ws
+            st.info(f"{translate('reporting_period', language)}: {ws} → {we}")
+        elif "week_start" in df_week.columns and df_week["week_start"].notna().any():
+            ws = pd.Timestamp(df_week["week_start"].dropna().iloc[0]).date()
+            st.info(f"{translate('live_source', language)}: {live_label} - {ws}")
+        elif not PUBLIC_APP_MODE:
+            st.info(f"{translate('live_source', language)}: {live_label}")
+        if not PUBLIC_APP_MODE:
+            live_week_count = int(pd.to_datetime(df_live_season["week_start"], errors="coerce").nunique())
+            live_rows_key = "live_rows_one" if live_week_count == 1 else "live_rows"
+            st.caption(translate(live_rows_key, language, weeks=live_week_count, rows=len(df_live_season)))
+        try:
+            weather_outlook = load_area_forecast_cached()
+        except Exception:
+            weather_outlook = None
+        try:
+            next_week_forecast_df = load_next_week_forecast_cached(
+                history_years, live_signature, float(ndvi_green_thr), int(perennial_green_weeks), float(perennial_p25)
+            )
+        except Exception:
+            next_week_forecast_df = pd.DataFrame()
+        title_suffix = translate("current_monitoring", language)
 
-    df_week = add_ml_predictions(df_week, crop_map, ml_model, ml_meta)
+    df_week = add_priority_predictions(df_week, crop_map)
     display_prev_live_df = filter_display_rows(df_prev_live_scored) if not df_prev_live_scored.empty else pd.DataFrame()
 
-    def render_live_or_historical_section(section_df: pd.DataFrame, section_title: str, section_key: str, previous_section_df: pd.DataFrame | None = None):
+    def render_live_or_historical_section(
+        section_df: pd.DataFrame,
+        section_title: str,
+        section_key: str,
+        previous_section_df: pd.DataFrame | None = None,
+        show_pressure_map: bool = False,
+    ):
         display_week_df = filter_display_rows(section_df)
 
-        st.markdown('<div class="section-kicker">Operational Summary</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-kicker">{html.escape(translate("operational_summary", language))}</div>', unsafe_allow_html=True)
         st.subheader(section_title)
         ct_counts = display_week_df["crop_type"].value_counts(dropna=False).to_dict() if not display_week_df.empty else {}
         vc = _safe_num(display_week_df.get("veg_flag")).value_counts(dropna=False).to_dict() if "veg_flag" in display_week_df.columns else {}
         nc = display_week_df["need_class_ml"].value_counts(dropna=False).to_dict() if not display_week_df.empty else {}
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Perennial cells", f"{int(ct_counts.get('PERENNIAL', 0)):,}")
-        c2.metric("Annual cells", f"{int(ct_counts.get('ANNUAL', 0)):,}")
-        c3.metric("Valid vegetation", f"{int(vc.get(1, 0)):,}")
-        c4.metric("NOW / SOON / WAIT", f"{int(nc.get('NOW', 0)):,} / {int(nc.get('SOON', 0)):,} / {int(nc.get('WAIT', 0)):,}")
+        c1.metric(translate("perennial_cells", language), f"{int(ct_counts.get('PERENNIAL', 0)):,}")
+        c2.metric(translate("annual_cells", language), f"{int(ct_counts.get('ANNUAL', 0)):,}")
+        c3.metric(translate("valid_vegetation", language), f"{int(vc.get(1, 0)):,}")
+        c4.metric(translate("priority_counts", language), f"{int(nc.get('NOW', 0)):,} / {int(nc.get('SOON', 0)):,} / {int(nc.get('WAIT', 0)):,}")
 
         top_cols = [c for c in ["cell_id", "crop_type", "need_class_ml", "need_prob_ml", "NDVI_med", "NDMI_med", "dNDMI", "ndmi_drop_ytd", "Rain_mm_7d", "Rain2w", "Rain3w", "Temp_C_7d"] if c in section_df.columns]
         if display_week_df.empty:
-            st.warning("No valid cells remain after removing rows with -9999 or invalid vegetation flags.")
-        else:
-            st.markdown('<div class="section-kicker">Highest Priority Cells</div>', unsafe_allow_html=True)
-            st.dataframe(display_week_df.sort_values("need_prob_ml", ascending=False)[top_cols].head(20), use_container_width=True)
+            st.warning(translate("no_public_results", language))
+        elif not PUBLIC_APP_MODE:
+            st.markdown(f'<div class="section-kicker">{html.escape(translate("highest_priority_cells", language))}</div>', unsafe_allow_html=True)
+            priority_table = display_week_df.sort_values("need_prob_ml", ascending=False)[top_cols].head(20).copy()
+            if "crop_type" in priority_table.columns:
+                priority_table["crop_type"] = priority_table["crop_type"].replace({
+                    "ANNUAL": translate("annual", language),
+                    "PERENNIAL": translate("perennial", language),
+                    "NON_AGRI": translate("non_agri", language),
+                })
+            if "need_class_ml" in priority_table.columns:
+                priority_table["need_class_ml"] = priority_table["need_class_ml"].replace({
+                    "WAIT": translate("class_wait", language),
+                    "SOON": translate("class_soon", language),
+                    "NOW": translate("class_now", language),
+                })
+            priority_table = priority_table.rename(columns={
+                "cell_id": translate("cell_id", language),
+                "crop_type": translate("crop_type", language),
+                "need_class_ml": translate("priority_class", language),
+                "need_prob_ml": translate("priority_score", language),
+            })
+            st.dataframe(priority_table, use_container_width=True)
 
-        ui_context = {
-            "mode": mode,
-            "title_suffix": section_title,
-            "ndvi_green_threshold": float(ndvi_green_thr),
-            "perennial_green_weeks_threshold": int(perennial_green_weeks),
-            "perennial_ndvi_p25_threshold": float(perennial_p25),
-            "show_gray_cells": bool(show_gray_cells),
-            "show_boundary_labels": bool(show_boundary_labels),
-            "section_key": section_key,
-        }
-        model_context = build_model_context(ml_meta, yearly_eval, top_features)
+        ui_context = {"mode": mode, "title_suffix": section_title, "section_key": section_key}
+        if not PUBLIC_APP_MODE:
+            ui_context.update({
+                "ndvi_green_threshold": float(ndvi_green_thr),
+                "perennial_green_weeks_threshold": int(perennial_green_weeks),
+                "perennial_ndvi_p25_threshold": float(perennial_p25),
+                "palette_mode": palette_mode,
+                "show_gray_cells": bool(show_gray_cells),
+                "show_boundary_labels": bool(show_boundary_labels),
+                "zero_to_gray_need_threshold": float(zero_to_gray_eps),
+            })
+        model_context = None if PUBLIC_APP_MODE else build_method_context((forecast_bundle or {}).get("metadata"))
         previous_years_summary = build_previous_years_summary(display_week_df, reference_exports)
         live_comparison_summary = build_live_comparison_summary(display_week_df, previous_section_df if previous_section_df is not None and not previous_section_df.empty else None)
+        if PUBLIC_APP_MODE and live_comparison_summary:
+            live_comparison_summary = dict(live_comparison_summary)
+            live_comparison_summary.pop("current_live_file", None)
+            live_comparison_summary.pop("previous_live_file", None)
         spatial_cluster_summary = build_spatial_cluster_summary(
             grid=grid,
             week_df=display_week_df,
             boundary=boundary,
+            urgent_probability_threshold=max(0.5, float(zero_to_gray_eps)),
         )
         copilot_context = build_copilot_context(
             df_week=display_week_df,
             title_suffix=section_title,
             mode=mode,
-            live_label=live_label,
+            live_label=None if PUBLIC_APP_MODE else live_label,
             previous_years_summary=previous_years_summary,
             model_context=model_context,
             ui_context=ui_context,
             live_comparison_summary=live_comparison_summary,
             spatial_cluster_summary=spatial_cluster_summary,
+            next_week_forecast=build_next_week_forecast_summary(next_week_forecast_df, display_week_df) if mode == "live" else None,
         )
+        copilot_context["weather_forecast_7d"] = weather_outlook
+        copilot_context["response_language"] = language
 
         focus_cell_options = []
         if "cell_id" in display_week_df.columns:
             focus_cell_options = display_week_df.sort_values("need_prob_ml", ascending=False)["cell_id"].astype(str).drop_duplicates().tolist()
         selected_cell_id = None
         selected_cell_context = None
-        if focus_cell_options:
-            selected_cell_id = st.selectbox("Focus cell", options=focus_cell_options, index=0, key=f"focus_cell_{section_key}")
+        if focus_cell_options and not PUBLIC_APP_MODE:
+            selected_cell_id = st.selectbox(translate("focus_cell", language), options=focus_cell_options, index=0, key=f"focus_cell_{section_key}")
             selected_cell_context = build_selected_cell_context(
                 df_week=display_week_df,
                 selected_cell_id=selected_cell_id,
@@ -1577,6 +1809,8 @@ def main_with_valid_display():
                 "week_start": copilot_context.get("week_start"),
                 "week_end": copilot_context.get("week_end"),
                 "selected_cell_id": selected_cell_id,
+                "language": language,
+                "weather_area": (weather_outlook or {}).get("area") if isinstance(weather_outlook, dict) else None,
             },
             sort_keys=True,
         )
@@ -1584,158 +1818,186 @@ def main_with_valid_display():
             st.session_state[f"{state_prefix}_context_key"] = context_key
             st.session_state[f"{state_prefix}_summary_text"] = None
             st.session_state[f"{state_prefix}_summary_error"] = None
+            st.session_state[f"{state_prefix}_outlook_text"] = None
+            st.session_state[f"{state_prefix}_outlook_error"] = None
             st.session_state[f"{state_prefix}_cell_text"] = None
             st.session_state[f"{state_prefix}_cell_error"] = None
             st.session_state[f"{state_prefix}_answer_text"] = None
             st.session_state[f"{state_prefix}_answer_error"] = None
 
-        render_ai_studio_header(section_title, selected_cell_id, display_week_df, spatial_cluster_summary)
-        summary_col, explain_col, model_col = st.columns([1.1, 1.1, 1.4])
+        render_ai_studio_header(section_title, selected_cell_id, display_week_df, spatial_cluster_summary, language)
+        action_columns = st.columns(2 if PUBLIC_APP_MODE else 3)
+        summary_col, outlook_col = action_columns[:2]
         with summary_col:
-            if st.button("Create executive briefing", use_container_width=True, key=f"summary_btn_{section_key}"):
-                summary_text, summary_error = generate_copilot_summary(copilot_context)
+            if st.button(translate("create_briefing", language), use_container_width=True, key=f"summary_btn_{section_key}"):
+                summary_text, summary_error = ai_generate_copilot_summary(copilot_context, language=language)
                 st.session_state[f"{state_prefix}_summary_text"] = summary_text
                 st.session_state[f"{state_prefix}_summary_error"] = summary_error
-        with explain_col:
-            if st.button("Explain selected cell", use_container_width=True, disabled=selected_cell_context is None, key=f"explain_btn_{section_key}"):
-                explain_text, explain_error = generate_copilot_response(
-                    context={
-                        "copilot_context": copilot_context,
-                        "focus_cell_context": selected_cell_context,
-                    },
-                    task_prompt=(
-                        "Explain the selected focus cell. "
-                        "Use short markdown headings. "
-                        "Cover predicted class, strongest evidence, historical context, previous-live context if available, and caution."
-                    ),
-                    max_output_tokens=550,
-                )
-                st.session_state[f"{state_prefix}_cell_text"] = explain_text
-                st.session_state[f"{state_prefix}_cell_error"] = explain_error
-        with model_col:
-            st.markdown(
-                f"""
-                <div class="ai-result-title">
-                    Model ready: {html.escape(DEFAULT_COPILOT_MODEL)}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+        with outlook_col:
+            if st.button(translate("next_week_outlook", language), use_container_width=True, key=f"outlook_btn_{section_key}"):
+                outlook_text, outlook_error = ai_generate_next_week_outlook(copilot_context, language=language)
+                st.session_state[f"{state_prefix}_outlook_text"] = outlook_text
+                st.session_state[f"{state_prefix}_outlook_error"] = outlook_error
+        if not PUBLIC_APP_MODE:
+            explain_col = action_columns[2]
+            with explain_col:
+                if st.button(translate("explain_cell", language), use_container_width=True, disabled=selected_cell_context is None, key=f"explain_btn_{section_key}"):
+                    explain_text, explain_error = ai_generate_copilot_response(
+                        context={
+                            "copilot_context": copilot_context,
+                            "focus_cell_context": selected_cell_context,
+                        },
+                        task_prompt=(
+                            "Explain the selected focus cell. "
+                            "Use short markdown headings. "
+                            "Cover predicted class, strongest evidence, historical context, previous-live context if available, and caution."
+                        ),
+                        max_output_tokens=550,
+                        language=language,
+                        kind="cell_explanation",
+                    )
+                    st.session_state[f"{state_prefix}_cell_text"] = explain_text
+                    st.session_state[f"{state_prefix}_cell_error"] = explain_error
 
-        ask_col, ask_button_col = st.columns([3, 1])
-        with ask_col:
-            user_question = st.text_input("Direct question", value="What changed from the previous monitoring week?", key=f"question_{section_key}")
-        with ask_button_col:
-            st.write("")
-            st.write("")
-            if st.button("Ask AI", key=f"ask_btn_{section_key}", use_container_width=True):
-                answer_text, answer_error = generate_copilot_response(
-                    context={
-                        "copilot_context": copilot_context,
-                        "focus_cell_context": selected_cell_context,
-                        "user_question": user_question,
-                    },
-                    task_prompt=f"Answer this user question from the supplied irrigation context: {user_question}",
-                    max_output_tokens=500,
-                )
-                st.session_state[f"{state_prefix}_answer_text"] = answer_text
-                st.session_state[f"{state_prefix}_answer_error"] = answer_error
+        st.caption(
+            translate("grounded_analysis", language)
+            if PUBLIC_APP_MODE
+            else translate("model_ready", language, model=AI_COPILOT_MODEL)
+        )
+        with st.expander(translate("knowledge_basis", language)):
+            st.caption(translate("knowledge_basis_caption", language))
+            for source in ai_knowledge_sources():
+                st.markdown(f"- [{source['title']}]({source['url']})")
+
+        if not PUBLIC_APP_MODE:
+            ask_col, ask_button_col = st.columns([3, 1])
+            with ask_col:
+                user_question = st.text_input(translate("direct_question", language), value=translate("default_question", language), key=f"question_{section_key}")
+            with ask_button_col:
+                st.write("")
+                st.write("")
+                if st.button(translate("ask_ai", language), key=f"ask_btn_{section_key}", use_container_width=True):
+                    answer_text, answer_error = ai_generate_copilot_response(
+                        context={
+                            "copilot_context": copilot_context,
+                            "focus_cell_context": selected_cell_context,
+                            "user_question": user_question,
+                        },
+                        task_prompt=f"Answer this user question from the supplied irrigation context: {user_question}",
+                        max_output_tokens=500,
+                        language=language,
+                        kind="direct_question",
+                    )
+                    st.session_state[f"{state_prefix}_answer_text"] = answer_text
+                    st.session_state[f"{state_prefix}_answer_error"] = answer_error
 
         if st.session_state.get(f"{state_prefix}_summary_error"):
             st.warning(st.session_state[f"{state_prefix}_summary_error"])
         elif st.session_state.get(f"{state_prefix}_summary_text"):
-            st.markdown('<div class="ai-result-title">Executive briefing</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ai-result-title">{html.escape(translate("briefing_result", language))}</div>', unsafe_allow_html=True)
             st.markdown(st.session_state[f"{state_prefix}_summary_text"])
+
+        if st.session_state.get(f"{state_prefix}_outlook_error"):
+            st.warning(st.session_state[f"{state_prefix}_outlook_error"])
+        elif st.session_state.get(f"{state_prefix}_outlook_text"):
+            st.markdown(f'<div class="ai-result-title">{html.escape(translate("outlook_result", language))}</div>', unsafe_allow_html=True)
+            st.markdown(st.session_state[f"{state_prefix}_outlook_text"])
 
         if st.session_state.get(f"{state_prefix}_cell_error"):
             st.warning(st.session_state[f"{state_prefix}_cell_error"])
         elif st.session_state.get(f"{state_prefix}_cell_text"):
-            st.markdown('<div class="ai-result-title">Selected cell analysis</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ai-result-title">{html.escape(translate("cell_result", language))}</div>', unsafe_allow_html=True)
             st.markdown(st.session_state[f"{state_prefix}_cell_text"])
 
         if st.session_state.get(f"{state_prefix}_answer_error"):
             st.warning(st.session_state[f"{state_prefix}_answer_error"])
         elif st.session_state.get(f"{state_prefix}_answer_text"):
-            st.markdown('<div class="ai-result-title">AI answer</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ai-result-title">{html.escape(translate("answer_result", language))}</div>', unsafe_allow_html=True)
             st.markdown(st.session_state[f"{state_prefix}_answer_text"])
 
-        with st.expander("Copilot context snapshot"):
-            st.json(copilot_context)
+        if SHOW_INTERNAL_DIAGNOSTICS:
+            with st.expander(translate("context_snapshot", language)):
+                st.json(copilot_context)
+            if selected_cell_context is not None:
+                with st.expander(translate("focus_context", language)):
+                    st.json(selected_cell_context)
 
-        if selected_cell_context is not None:
-            with st.expander("Focus cell context"):
-                st.json(selected_cell_context)
-
-        if spatial_cluster_summary and spatial_cluster_summary.get("clusters"):
-            st.subheader("Priority Zones")
-            cluster_rows = []
-            for cluster in spatial_cluster_summary.get("clusters", []):
-                cluster_rows.append(
-                    {
-                        "cluster_id": cluster.get("cluster_id"),
-                        "boundary_name": cluster.get("boundary_name"),
-                        "cell_count": cluster.get("cell_count"),
-                        "dominant_class": cluster.get("dominant_class"),
-                        "dominant_crop_type": cluster.get("dominant_crop_type"),
-                        "mean_need_probability": cluster.get("mean_need_probability"),
-                        "max_need_probability": cluster.get("max_need_probability"),
-                        "center_lat": cluster.get("center_lat"),
-                        "center_lon": cluster.get("center_lon"),
-                    }
-                )
-            st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True)
-
-        render_map(
-            grid=grid,
-            boundary=boundary,
-            week_df=section_df,
-            show_boundary_labels=show_boundary_labels,
-            show_gray_cells=show_gray_cells,
-            map_key=f"irrigation_map_{section_key}",
-        )
+        if show_pressure_map:
+            st.subheader(translate("tool_pressure_map", language))
+            render_approved_pressure_surface(
+                display_week_df,
+                boundary,
+                language,
+                map_key=f"operations_{section_key}",
+            )
 
     if mode == "live":
-        st.header("Current Monitoring")
-        overall_tab, annual_tab, perennial_tab = st.tabs(["Overall", "Annual crops", "Perennial crops"])
+        if weather_outlook and weather_outlook.get("area"):
+            area_weather = weather_outlook["area"]
+            st.subheader(translate("weather_outlook", language))
+            w1, w2, w3, w4, w5 = st.columns(5)
+            w1.metric(translate("forecast_rain", language), f"{area_weather['rain_mm_7d']:.1f} mm")
+            w2.metric(translate("forecast_et0", language), f"{area_weather['et0_mm_7d']:.1f} mm")
+            w3.metric(translate("forecast_balance", language), f"{area_weather['rain_minus_et0_mm']:+.1f} mm")
+            w4.metric(translate("forecast_temperature", language), f"{area_weather['temperature_max_mean_c']:.1f} °C")
+            w5.metric(translate("forecast_wind", language), f"{area_weather['wind_max_kmh']:.1f} km/h")
+            st.caption(f"{translate('forecast_points', language)}: {area_weather['point_count']}")
+        else:
+            st.info(translate("forecast_unavailable", language))
 
-        with overall_tab:
+        st.header(translate("current_monitoring", language))
+        if PUBLIC_APP_MODE:
             render_live_or_historical_section(
                 section_df=df_week,
-                section_title="Current overview",
+                section_title=translate("current_overview", language),
                 section_key="live_overall",
                 previous_section_df=display_prev_live_df,
+                show_pressure_map=True,
             )
+        else:
+            overall_tab, annual_tab, perennial_tab = st.tabs([
+                translate("overall", language),
+                translate("annual_crops", language),
+                translate("perennial_crops", language),
+            ])
 
-        with annual_tab:
-            annual_df = df_week[df_week.get("crop_type", "").astype(str).str.upper() == "ANNUAL"].copy()
-            prev_annual_df = display_prev_live_df[display_prev_live_df.get("crop_type", "").astype(str).str.upper() == "ANNUAL"].copy() if not display_prev_live_df.empty else pd.DataFrame()
-            render_live_or_historical_section(
-                section_df=annual_df,
-                section_title="Annual crop priority",
-                section_key="live_annual",
-                previous_section_df=prev_annual_df,
-            )
+            with overall_tab:
+                render_live_or_historical_section(
+                    section_df=df_week,
+                    section_title=translate("current_overview", language),
+                    section_key="live_overall",
+                    previous_section_df=display_prev_live_df,
+                    show_pressure_map=True,
+                )
 
-        with perennial_tab:
-            perennial_df = df_week[df_week.get("crop_type", "").astype(str).str.upper() == "PERENNIAL"].copy()
-            prev_perennial_df = display_prev_live_df[display_prev_live_df.get("crop_type", "").astype(str).str.upper() == "PERENNIAL"].copy() if not display_prev_live_df.empty else pd.DataFrame()
-            render_live_or_historical_section(
-                section_df=perennial_df,
-                section_title="Perennial crop priority",
-                section_key="live_perennial",
-                previous_section_df=prev_perennial_df,
-            )
+            with annual_tab:
+                annual_df = df_week[df_week.get("crop_type", "").astype(str).str.upper() == "ANNUAL"].copy()
+                prev_annual_df = display_prev_live_df[display_prev_live_df.get("crop_type", "").astype(str).str.upper() == "ANNUAL"].copy() if not display_prev_live_df.empty else pd.DataFrame()
+                render_live_or_historical_section(
+                    section_df=annual_df,
+                    section_title=translate("annual_priority", language),
+                    section_key="live_annual",
+                    previous_section_df=prev_annual_df,
+                )
+
+            with perennial_tab:
+                perennial_df = df_week[df_week.get("crop_type", "").astype(str).str.upper() == "PERENNIAL"].copy()
+                prev_perennial_df = display_prev_live_df[display_prev_live_df.get("crop_type", "").astype(str).str.upper() == "PERENNIAL"].copy() if not display_prev_live_df.empty else pd.DataFrame()
+                render_live_or_historical_section(
+                    section_df=perennial_df,
+                    section_title=translate("perennial_priority", language),
+                    section_key="live_perennial",
+                    previous_section_df=prev_perennial_df,
+                )
     else:
         render_live_or_historical_section(
             section_df=df_week,
             section_title=title_suffix,
             section_key="historical_main",
             previous_section_df=display_prev_live_df,
+            show_pressure_map=True,
         )
 
 
-main = main_with_valid_display
-
-
 if __name__ == "__main__":
-    main_with_valid_display()
+    main()
