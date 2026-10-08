@@ -1,0 +1,180 @@
+{
+  "version": "2026-08-29",
+  "cards": [
+    {
+      "id": "fao_et0_crop_water",
+      "title": "Reference water demand is not an irrigation depth",
+      "topics": ["irrigation scheduling", "weather", "evapotranspiration", "crop stage"],
+      "keywords": ["et0", "eto", "evapotranspiration", "weather", "forecast", "crop water", "kc", "rain", "temperature", "ջրի պահանջարկ", "եղանակ", "տեղումներ", "կանխատեսում"],
+      "principles": [
+        "ET0 describes atmospheric evaporative demand for a reference surface and is driven by weather.",
+        "Crop water use requires crop and growth-stage information, commonly represented by a crop coefficient, in addition to ET0.",
+        "A rain-minus-ET0 value is a useful weather-pressure indicator, but it is not the irrigation depth to apply."
+      ],
+      "guardrails": [
+        "Do not convert forecast ET0 or rain-minus-ET0 directly into an irrigation amount when crop coefficient, effective rainfall, soil storage, rooting depth, and application efficiency are unavailable."
+      ],
+      "sources": [
+        {
+          "id": "FAO-56",
+          "title": "Crop evapotranspiration: Guidelines for computing crop water requirements",
+          "publisher": "FAO",
+          "url": "https://www.fao.org/4/X0490E/x0490e00.htm"
+        }
+      ]
+    },
+    {
+      "id": "fao_root_zone_balance",
+      "title": "Irrigation timing depends on the root-zone water balance",
+      "topics": ["soil water", "root zone", "irrigation scheduling", "rainfall"],
+      "keywords": ["soil", "root", "root zone", "raw", "taw", "depletion", "water balance", "irrigation timing", "effective rain", "հող", "արմատ", "ջրային հաշվեկշիռ", "ոռոգում"],
+      "principles": [
+        "The crop root zone acts as a water reservoir that is depleted by crop water use and replenished by effective rain and irrigation.",
+        "Crop stress becomes more likely after root-zone depletion exceeds the readily available water threshold.",
+        "Rooting depth, soil water-holding capacity, crop sensitivity, runoff, drainage, and irrigation efficiency affect a field schedule."
+      ],
+      "guardrails": [
+        "Without field soil moisture or a calibrated root-zone balance, recommend field checking and prioritization rather than an exact irrigation date or volume."
+      ],
+      "sources": [
+        {
+          "id": "FAO-56-CH8",
+          "title": "FAO-56 Chapter 8: ETc under soil water stress conditions",
+          "publisher": "FAO",
+          "url": "https://www.fao.org/4/x0490e/x0490e0e.htm"
+        },
+        {
+          "id": "FAO-CROPWAT",
+          "title": "CROPWAT decision-support method",
+          "publisher": "FAO",
+          "url": "https://www.fao.org/land-water/resources/tools/software/cropwat/en"
+        }
+      ]
+    },
+    {
+      "id": "eo_ndvi_temporal",
+      "title": "NDVI is strongest as a temporal vegetation indicator",
+      "topics": ["earth observation", "NDVI", "vegetation", "phenology", "historical comparison"],
+      "keywords": ["ndvi", "vegetation", "greenness", "phenology", "historical", "season", "anomaly", "green cover", "բուսածածկ", "կանաչ", "սեզոն", "նախորդ տարիներ"],
+      "principles": [
+        "NDVI is an indicator of vegetation greenness, density, and condition, not a direct measurement of irrigation.",
+        "Comparison with the same part of prior seasons helps separate unusual behavior from normal crop development.",
+        "NDVI can saturate over dense vegetation and can be influenced by soil background and phenological stage."
+      ],
+      "guardrails": [
+        "Do not label a cause such as water shortage from NDVI alone; combine it with moisture indices, weather, temporal change, crop context, and spatial persistence."
+      ],
+      "sources": [
+        {
+          "id": "USGS-NDVI",
+          "title": "NDVI, the foundation for remote-sensing phenology",
+          "publisher": "U.S. Geological Survey",
+          "url": "https://www.usgs.gov/special-topics/remote-sensing-phenology/science/ndvi-foundation-remote-sensing-phenology"
+        }
+      ]
+    },
+    {
+      "id": "eo_ndmi_canopy_water",
+      "title": "NDMI indicates changes in canopy water content",
+      "topics": ["earth observation", "NDMI", "canopy moisture", "water stress"],
+      "keywords": ["ndmi", "moisture", "canopy water", "swir", "nir", "dndmi", "drying", "խոնավություն", "չորացում", "ջրային սթրես"],
+      "principles": [
+        "NDMI combines near-infrared and shortwave-infrared reflectance to track changes related to vegetation liquid water content.",
+        "A declining NDMI can support a drying interpretation when it agrees with the crop's own history, weather, and neighboring cells.",
+        "Canopy moisture response can lag or be influenced by crop development, harvest, disease, soil exposure, and mixed land cover."
+      ],
+      "guardrails": [
+        "NDMI does not prove that irrigation occurred or did not occur, and it does not replace soil-moisture observations."
+      ],
+      "sources": [
+        {
+          "id": "GAO-1996",
+          "title": "NDWI: A normalized difference water index for remote sensing of vegetation liquid water",
+          "publisher": "Remote Sensing of Environment",
+          "url": "https://doi.org/10.1016/S0034-4257(96)00067-3"
+        }
+      ]
+    },
+    {
+      "id": "sentinel2_quality_scale",
+      "title": "Optical EO evidence must respect clouds, resolution, and mixed pixels",
+      "topics": ["Sentinel-2", "data quality", "cloud mask", "spatial scale"],
+      "keywords": ["sentinel", "cloud", "shadow", "quality", "resolution", "pixel", "grid", "250 m", "mixed", "ամպ", "ստվեր", "բջիջ", "ցանց"],
+      "principles": [
+        "Sentinel-2 Level-2A provides scene classes for cloud, cloud shadow, vegetation, bare soil, water, snow, and invalid observations.",
+        "The source bands used by vegetation and moisture indices have 10 m or 20 m pixel spacing, while this system summarizes evidence to 250 m cells.",
+        "Cell aggregation stabilizes an area-level signal but can hide within-cell variability and mixed land cover."
+      ],
+      "guardrails": [
+        "Treat isolated jumps and boundary cells cautiously; repeated behavior across nearby cells and weeks is more operationally meaningful."
+      ],
+      "sources": [
+        {
+          "id": "COPERNICUS-S2-L2A",
+          "title": "Sentinel-2 Level-2A documentation",
+          "publisher": "Copernicus Data Space Ecosystem",
+          "url": "https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/S2L2A.html"
+        },
+        {
+          "id": "ESA-S2-HANDBOOK",
+          "title": "Sentinel-2 User Handbook",
+          "publisher": "European Space Agency",
+          "url": "https://sentinels.copernicus.eu/documents/247904/685211/Sentinel-2_User_Handbook"
+        }
+      ]
+    },
+    {
+      "id": "weather_forecast_scenario",
+      "title": "A seven-day forecast is a scenario, not an observation",
+      "topics": ["weather forecast", "rain probability", "operational planning"],
+      "keywords": ["forecast", "next week", "seven day", "rain probability", "uncertainty", "scenario", "weather outlook", "կանխատեսում", "առաջիկա շաբաթ", "անձրևի հավանականություն"],
+      "principles": [
+        "Forecast rainfall and ET0 can change which already-stressed areas should be checked first.",
+        "Forecast uncertainty should be represented in decisions through conditional language and adjustable actions.",
+        "Current observations and model priority remain separate from the future weather scenario."
+      ],
+      "guardrails": [
+        "Use phrases such as 'if the forecast holds' and avoid presenting a forecast as a confirmed irrigation need."
+      ],
+      "sources": [
+        {
+          "id": "WMO-FORECAST-UNCERTAINTY",
+          "title": "Communicating forecast uncertainty for service providers",
+          "publisher": "World Meteorological Organization",
+          "url": "https://wmo.int/resources/bulletin/vol-57-4-2008/communicating-forecast-uncertainty-service-providers"
+        }
+      ]
+    },
+    {
+      "id": "spatial_temporal_evidence",
+      "title": "Repeated zones are stronger evidence than isolated cells",
+      "topics": ["spatial analysis", "temporal analysis", "priority zones"],
+      "keywords": ["zone", "cluster", "nearby", "neighbor", "previous week", "trend", "persistent", "cell", "գոտի", "հարևան", "նախորդ շաբաթ", "շարունակական"],
+      "principles": [
+        "A coherent cluster of neighboring high-priority cells is more useful for field operations than an isolated cell with the same score.",
+        "Persistence or worsening across consecutive observations strengthens the case for field inspection.",
+        "A single-week change can reflect phenology, observation conditions, or local management and should be checked against history."
+      ],
+      "guardrails": [
+        "Do not invent persistence when only one observation is supplied."
+      ],
+      "sources": []
+    },
+    {
+      "id": "echmiadzin_decision_contract",
+      "title": "Echmiadzin public decision contract",
+      "topics": ["priority rules", "next-week forecast", "AI interpretation", "public communication", "crop estimate"],
+      "keywords": ["priority", "wait", "soon", "now", "rules", "forecast", "next week", "model", "ml", "ai", "crop type", "public", "առաջնահերթություն", "կանխատեսում", "մոդել", "մշակաբույս"],
+      "principles": [
+        "WAIT, SOON, and NOW are rule-based priority classes from 2-week NDMI level and trend, the cell's own history, and recent rain; AI explains them but does not replace or relabel them.",
+        "NOW requires dry conditions in two consecutive weeks; the next-week forecast is a model estimate of next week's class, not an observation.",
+        "NOW means high irrigation priority and a reason to inspect or coordinate, not an automatic instruction to irrigate.",
+        "Crop type is a stable system estimate derived from historical seasonal behavior and is contextual evidence, not ground truth."
+      ],
+      "guardrails": [
+        "Do not expose internal validation labels, hidden-cell reasons, API details, or unsupported certainty statements in public text."
+      ],
+      "sources": []
+    }
+  ]
+}

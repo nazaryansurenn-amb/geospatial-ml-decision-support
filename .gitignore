@@ -1,6 +1,10 @@
 # --- Operational data. Never commit: this is the Association's operating record. ---
-# weekly/live exports, cell coordinates
-data/
+# weekly/live exports, cell coordinates, prepared runtime files
+data/*
+# curated FAO / EO interpretation notes used by the AI briefings: not Association data
+!data/knowledge/
+# evaluation outputs computed from the Association's data
+reports/
 # field boundary shapefile
 boundary/
 # trained model, metadata, training snapshots

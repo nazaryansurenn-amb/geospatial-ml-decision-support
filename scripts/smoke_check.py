@@ -1,67 +1,63 @@
+"""End-to-end check on real data: runtime files, rules and one next-week forecast for the latest live week.
+
+Usage:
+    python scripts/smoke_check.py
+    python scripts/smoke_check.py --root path/to/project   # a folder holding data/ and models/
+Exits with code 1 when a required file is missing or the forecast cannot be made.
+"""
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
-import json
 import sys
 
-import joblib
-import numpy as np
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from core.features import build_temporal_features  # noqa: E402 - needs ROOT on sys.path
-from core.io import normalize_weekly_df  # noqa: E402
-
-MODEL_PATH = ROOT / "models" / "need_rf_pipeline.joblib"
-META_PATH = ROOT / "models" / "need_rf_metadata.json"
-LIVE_DIR = ROOT / "data" / "live_exports"
+from core.features import build_temporal_features
+from core.io import assemble_live_season, normalize_cell_id
+from core.next_week import build_forecast_features, load_forecast_bundle, predict_next_week
+from core.rules import CLASS_ORDER, assign_rule_classes
+from core.runtime_artifacts import artifact_paths
 
 
 def main() -> int:
-    if not MODEL_PATH.exists():
-        print(f"[FAIL] Model missing: {MODEL_PATH}")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", type=Path, default=ROOT)
+    root = parser.parse_args().root
+    runtime = root / "data" / "runtime"
+
+    required = [artifact_paths(runtime)["monthly_baselines"], artifact_paths(runtime)["stable_crop_map"],
+                root / "models" / "next_week_forecast.joblib"]
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        print("[FAIL] missing: " + ", ".join(missing))
         return 1
 
-    live_files = sorted(LIVE_DIR.glob("*.csv"))
-    if not live_files:
-        print(f"[FAIL] No live files found in: {LIVE_DIR}")
+    season, report = assemble_live_season(root / "data" / "live_exports")
+    if season.empty or report.errors:
+        print("[FAIL] no usable live exports: " + "; ".join(report.messages("error")))
         return 1
+    baselines = pd.read_parquet(artifact_paths(runtime)["monthly_baselines"])
+    baselines["cell_id"] = baselines["cell_id"].map(normalize_cell_id)
+    crop_map = pd.read_parquet(artifact_paths(runtime)["stable_crop_map"])
+    crop_map["cell_id"] = crop_map["cell_id"].map(normalize_cell_id)
 
-    latest = live_files[-1]
-    df = pd.read_csv(latest, low_memory=False)
-    df = normalize_weekly_df(df)
-    df = build_temporal_features(df)
+    classified = assign_rule_classes(build_temporal_features(season, history_monthly_baselines=baselines))
+    features = build_forecast_features(classified, crop_map)
+    latest = features[features["week_start"] == features["week_start"].max()]
+    forecast = predict_next_week(latest, load_forecast_bundle(root / "models"))
 
-    model = joblib.load(MODEL_PATH)
-    meta = {}
-    if META_PATH.exists():
-        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
-
-    feature_cols_num = meta.get("feature_cols_num", [])
-    feature_cols_cat = meta.get("feature_cols_cat", [])
-    needed = feature_cols_num + feature_cols_cat
-
-    if not needed:
-        print("[FAIL] Metadata has no feature columns.")
-        return 1
-
-    sample = df.head(20).copy()
-    for col in feature_cols_num:
-        if col not in sample.columns:
-            sample[col] = np.nan
-        sample[col] = pd.to_numeric(sample[col], errors="coerce")
-    for col in feature_cols_cat:
-        if col not in sample.columns:
-            sample[col] = "ANNUAL"
-        sample[col] = sample[col].astype(str)
-
-    preds = model.predict(sample[needed])
-    print(f"[OK] Smoke check passed on file: {latest.name}")
-    print(f"[OK] Rows scored: {len(sample)}")
-    print(f"[OK] Pred classes sample: {pd.Series(preds).value_counts().to_dict()}")
+    week = pd.Timestamp(latest["week_start"].max()).date()
+    now = forecast["rule_class"].value_counts().reindex(CLASS_ORDER, fill_value=0).to_dict()
+    nxt = forecast["next_class"].value_counts().reindex(CLASS_ORDER, fill_value=0).to_dict()
+    print(f"[OK] latest live week {week}: {len(forecast):,} vegetated cells")
+    print(f"     this week (rules): {now}")
+    print(f"     next week (model): {nxt}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
